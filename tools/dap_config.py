@@ -355,16 +355,16 @@ class SerialTransport(Transport):
 # 假设备:没有板子也能把界面完整点一遍(--mock / --selftest)
 # ---------------------------------------------------------------------- #
 
-MOCK_FACTORY_NETS = [("SENLO/2", "12345678"), ("DAP", "12345678"), ("OTA", "12345678")]
+MOCK_FACTORY_NETS = [("MyWiFi", "12345678"), ("DAP", "12345678"), ("OTA", "12345678")]
 
 # 前 4 项覆盖:普通 SSID、无密码、空格+中文、长名。密码统一 12345678。
 MOCK_SCAN = [
-    ("SENLO/2", -48, "WPA/WPA2", 6, "12345678"),
+    ("MyWiFi", -48, "WPA/WPA2", 6, "12345678"),
     ("DAP", -61, "WPA2", 1, "12345678"),
     ("\u5c0f\u7f8e\u7684 WiFi", -70, "WPA/WPA2", 3, "12345678"),
     ("HUAWEI-5G", -76, "WPA2", 11, "12345678"),
-    ("TP-LINK_8888", -83, "WPA2", 9, "12345678"),
-    ("CMCC-Free", -88, "OPEN", 6, ""),
+    ("RouterB", -83, "WPA2", 9, "12345678"),
+    ("PublicWiFi", -88, "OPEN", 6, ""),
 ]
 
 
@@ -380,8 +380,8 @@ class MockTransport(Transport):
     def __init__(self, connect_delay: float = 1.0):
         self._open = False
         self._mode = "STA"
-        self._ip = "192.168.0.125"
-        self._ssid = "SENLO/2"
+        self._ip = "192.168.7.125"
+        self._ssid = "MyWiFi"
         self._rssi = -48
         self._ch = 6
         self._saved = [[s, p, 0] for (s, p) in MOCK_FACTORY_NETS]
@@ -437,10 +437,10 @@ class MockTransport(Transport):
         self._emit("I (1234) mock: got @%s" % cmd, 0.0)
 
         if cmd == "PING":
-            self._emit("@OK pong fw=0.7.0 mac=AC:A7:04:15:04:FC mode=%s" % self._mode, 0.02)
+            self._emit("@OK pong fw=0.7.0 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
         elif cmd == "STATUS":
             if self._mode == "AP":
-                self._emit("@OK mode=AP ip=%s ssid=DAP-04FC" % AP_DEFAULT_IP, 0.02)
+                self._emit("@OK mode=AP ip=%s ssid=DAP-EEFC" % AP_DEFAULT_IP, 0.02)
             else:
                 self._emit("@OK mode=STA ssid=%s ip=%s rssi=%d ch=%d"
                            % (self._ssid, self._ip, self._rssi, self._ch), 0.02)
@@ -521,7 +521,7 @@ class MockTransport(Transport):
                 self._emit("@ERR 400 mode_must_be_STA_or_AP", 0.02)
             elif want == "AP":
                 self._mode = "AP"
-                self._emit("@OK mode=AP ip=%s ssid=DAP-04FC" % AP_DEFAULT_IP, 0.2)
+                self._emit("@OK mode=AP ip=%s ssid=DAP-EEFC" % AP_DEFAULT_IP, 0.2)
             else:
                 self._mode = "STA"
                 self._emit("@OK mode=STA", 0.2)
@@ -994,7 +994,7 @@ def run_selftest() -> int:
 
     # --- 1. 编码 -----------------------------------------------------
     print("\n[1] SSID/密码编码")
-    for raw in ["SENLO/2", "小美的 WiFi", "a&b=c", "p+ss", "100%", "plain"]:
+    for raw in ["MyWiFi", "小美的 WiFi", "a&b=c", "p+ss", "100%", "plain"]:
         expect_eq("enc/dec 往返 %r" % raw, dec(enc(raw)), raw)
     expect_eq("空格编成 %20", enc("a b"), "a%20b")
     expect_eq("加号不被当成空格", enc("a+b"), "a%2Bb")
@@ -1003,30 +1003,30 @@ def run_selftest() -> int:
 
     # --- 2. 帧解析 ---------------------------------------------------
     print("\n[2] 响应帧解析")
-    n = parse_scan_data("idx=3&ssid=SENLO/2&rssi=-52&auth=WPA/WPA2&ch=6")
-    check("扫描帧", n is not None and n.ssid == "SENLO/2" and n.rssi == -52
+    n = parse_scan_data("idx=3&ssid=MyWiFi&rssi=-52&auth=WPA/WPA2&ch=6")
+    check("扫描帧", n is not None and n.ssid == "MyWiFi" and n.rssi == -52
           and n.auth == "WPA/WPA2" and n.channel == 6, repr(n))
     n2 = parse_scan_data("idx=0&ssid=小美的 WiFi&rssi=-70&auth=WPA2&ch=3")
     check("扫描帧含空格+中文", n2 is not None and n2.ssid == "小美的 WiFi", repr(n2))
     n3 = parse_scan_data("idx=0&ssid=a&b=c&rssi=-60&auth=OPEN&ch=1")
     check("扫描帧含 &", n3 is not None and n3.ssid == "a&b=c", repr(n3))
 
-    st = parse_status("mode=STA ssid=SENLO/2 ip=192.168.0.125 rssi=-72 ch=11")
-    check("STA 状态", st is not None and st.mode == "STA" and st.ip == "192.168.0.125"
+    st = parse_status("mode=STA ssid=MyWiFi ip=192.168.7.125 rssi=-72 ch=11")
+    check("STA 状态", st is not None and st.mode == "STA" and st.ip == "192.168.7.125"
           and st.rssi == -72 and st.channel == 11, repr(st))
     st2 = parse_status("mode=STA ssid=小美的 WiFi ip=192.168.0.9 rssi=-60 ch=6")
     check("STA 状态含空格 SSID", st2 is not None and st2.ssid == "小美的 WiFi", repr(st2))
-    st3 = parse_status("mode=AP ip=192.168.4.1 ssid=DAP-04FC")
+    st3 = parse_status("mode=AP ip=192.168.4.1 ssid=DAP-EEFC")
     check("AP 状态", st3 is not None and st3.mode == "AP"
-          and st3.ip == "192.168.4.1" and st3.ssid == "DAP-04FC", repr(st3))
+          and st3.ip == "192.168.4.1" and st3.ssid == "DAP-EEFC", repr(st3))
 
-    p = parse_ping("pong fw=0.7.0 mac=AC:A7:04:15:04:FC mode=STA")
+    p = parse_ping("pong fw=0.7.0 mac=AA:BB:CC:DD:EE:FC mode=STA")
     check("PING 帧", p is not None and p.fw == "0.7.0"
-          and p.mac == "AC:A7:04:15:04:FC" and p.mode == "STA", repr(p))
+          and p.mac == "AA:BB:CC:DD:EE:FC" and p.mode == "STA", repr(p))
 
-    ck = RE_CONNECT_OK.match("connected ssid=SENLO/2 ip=192.168.0.125")
-    check("CONNECT 成功帧", ck is not None and ck.group(1) == "SENLO/2"
-          and ck.group(2) == "192.168.0.125")
+    ck = RE_CONNECT_OK.match("connected ssid=MyWiFi ip=192.168.7.125")
+    check("CONNECT 成功帧", ck is not None and ck.group(1) == "MyWiFi"
+          and ck.group(2) == "192.168.7.125")
     ck2 = RE_CONNECT_OK.match("connected ssid=小美的 WiFi ip=192.168.0.9")
     check("CONNECT 成功帧含空格", ck2 is not None and ck2.group(1) == "小美的 WiFi", repr(ck2))
 
@@ -1037,8 +1037,8 @@ def run_selftest() -> int:
     check("ERR 帧带空格说明", em2 is not None and int(em2.group(1)) == 400
           and em2.group(2) == "usage: @MODE STA|AP", repr(em2))
 
-    li = parse_list_data("idx=0&ssid=SENLO/2&pass=***&pin=0")
-    check("LIST 帧(无 pin)", li == (0, "SENLO/2", "***", 0), repr(li))
+    li = parse_list_data("idx=0&ssid=MyWiFi&pass=***&pin=0")
+    check("LIST 帧(无 pin)", li == (0, "MyWiFi", "***", 0), repr(li))
     li2 = parse_list_data("idx=1&ssid=小美的 WiFi&pass=***&pin=1")
     check("LIST 帧(pin=1)", li2 == (1, "小美的 WiFi", "***", 1), repr(li2))
     li3 = parse_list_data("idx=2&ssid=DAP&pass=***")
@@ -1079,13 +1079,13 @@ def run_selftest() -> int:
         r = client.connect("不存在的网络", "x")
         check("未知 SSID -> 201", (not r.ok) and r.code == 201, "%s %s" % (r.code, r.text))
 
-        r = client.connect("SENLO/2", "wrong-password")
+        r = client.connect("MyWiFi", "wrong-password")
         check("错密码 -> 15", (not r.ok) and r.code == 15, "%s %s" % (r.code, r.text))
 
         r = client.connect("小美的 WiFi", "12345678")
         check("带空格中文 SSID 能连上", r.ok, "%s %s" % (r.code, r.text))
         m = RE_CONNECT_OK.match(r.text)
-        check("成功帧含 IP", m is not None and m.group(2) == "192.168.0.125", r.text)
+        check("成功帧含 IP", m is not None and m.group(2) == "192.168.7.125", r.text)
 
         rows, source = client.list_saved()
         check("连上后自动入列表", any(row[1] == "小美的 WiFi" for row in rows), rows)

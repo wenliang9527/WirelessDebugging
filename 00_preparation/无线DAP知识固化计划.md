@@ -7,7 +7,7 @@
 
 | 对象 | 动作 |
 | --- | --- |
-| 用户级 skill `wireless-dap` | **新建**,双写 `C:\Users\46166\.zcode\skills\` 与 `C:\Users\46166\.agents\skills\`(内容一致) |
+| 用户级 skill `wireless-dap` | **新建**,双写 `C:\Users\<user>\.zcode\skills\` 与 `C:\Users\<user>\.agents\skills\`(内容一致) |
 | 《usbip-ocdup联动计划.md》 | **两处小修**(见 §3) |
 | ocdup MCP 本体 | **零改动** |
 | ocdup-zcode 插件 | **零改动**(无代码变更,不涉及版本号/重启) |
@@ -27,8 +27,8 @@ description: 无线 DAP(ESP固件+usbip桥接)的掉线诊断与重挂。当 Ope
 
 ## 0. 拓扑与铁律(先读)
 
-- 链路:PC ⇄ WiFi ⇄ 路由器(SENLO/2 AP 域,192.168.0.x) ⇄ 无线 DAP(192.168.0.125,
-  MAC ac:a7:04:15:04:fc,DHCP 已静态绑定) ⇄ SWD ⇄ 目标板
+- 链路:PC ⇄ WiFi ⇄ 路由器(MyWiFi AP 域,192.168.7.x) ⇄ 无线 DAP(192.168.7.125,
+  MAC aa:bb:cc:dd:ee:fc,DHCP 已静态绑定) ⇄ SWD ⇄ 目标板
 - **Windows 设备树里的 CMSIS-DAP 是 usbip 虚拟的**——PC 与 DAP 之间没有 USB 线,
   任何"重插 USB 线"建议都是架构误判
 - **铁律 1:永远不要 `usbip list -r`**——windowsair 固件不实现 DEVLIST,该命令永久挂起
@@ -40,9 +40,9 @@ description: 无线 DAP(ESP固件+usbip桥接)的掉线诊断与重挂。当 Ope
 
 ## 1. 掉线诊断树(OpenOCD 找不到 CMSIS-DAP 时,按序三条只读检查定案)
 
-1. `ping 192.168.0.125` —— 不通 = 网络层问题:查 PC 是否连在 SENLO/2 的 AP 域(§4),
+1. `ping 192.168.7.125` —— 不通 = 网络层问题:查 PC 是否连在 MyWiFi 的 AP 域(§4),
    `arp -a | findstr "ac-a7-04"` 找 IP 是否漂移
-2. `powershell Test-NetConnection 192.168.0.125 -Port 3240` ——
+2. `powershell Test-NetConnection 192.168.7.125 -Port 3240` ——
    - **OPEN** = 固件 usbip 服务活着,掉的是 PC 侧 attach 进程 → 直接 §2 重挂(无需动 DAP)
    - **不通/挂起** = 固件 usbip 服务卡死(大概率有人跑过 list -r)→ 先给 DAP 断电重启,再 §2 重挂
 3. `powershell Get-PnpDevice | Where-Object FriendlyName -match 'CMSIS-DAP'` ——
@@ -53,7 +53,7 @@ description: 无线 DAP(ESP固件+usbip桥接)的掉线诊断与重挂。当 Ope
 ## 2. 重挂 / 拆桥
 
 - 挂:双击 `D:\ARMGCCTool\WirelessDebuggingtool\usbip-win\attach_dap_hidden.vbs`
-  (UAC 点"是",无黑窗;默认 IP 192.168.0.125,IP 变了可传参)。日志:同目录 attach_hidden_log.txt
+  (UAC 点"是",无黑窗;默认 IP 192.168.7.125,IP 变了可传参)。日志:同目录 attach_hidden_log.txt
 - 验证:设备树出现 "Wireless ESP CMSIS-DAP"(USBDevice 类)→ ocdup connect 即可
 - 拆:同目录 detach_dap.bat(管理员)
 - 保守规则:拆桥只走 detach_dap.bat,**不要 taskkill usbip 进程**(杀提权 usbip 进程会连坐桥接会话)
@@ -71,7 +71,7 @@ description: 无线 DAP(ESP固件+usbip桥接)的掉线诊断与重挂。当 Ope
 
 ## 4. 双路由拓扑陷阱
 
-PC 必须连 SENLO/2 的 AP 域(192.168.0.x)才能到达 DAP。
+PC 必须连 MyWiFi 的 AP 域(192.168.7.x)才能到达 DAP。
 [待补:另一台路由/域是什么,连错域的具体症状与判别方法]
 
 ## 5. 排外与共存
@@ -92,7 +92,7 @@ PC 必须连 SENLO/2 的 AP 域(192.168.0.x)才能到达 DAP。
 ## 3. 改动二:《usbip-ocdup联动计划.md》两刀
 
 1. **顶部横幅**(第 3 行引用块之后插入):
-   > ⚠️ 2026-10-27 起本文档网络语境过时:热点 192.168.137.x → 路由器 192.168.0.x(DAP 静态绑定 .125)。
+   > ⚠️ 2026-10-27 起本文档网络语境过时:热点 192.168.137.x → 路由器 192.168.7.x(DAP 静态绑定 .125)。
    > usbip 日常运维的权威指引 = 用户级 skill `wireless-dap`,本文仅作历史记录。
 2. **阶段 2-2 第一条命令**(第 46 行)改为:
    `~~usbip.exe list -r 192.168.137.253~~` **❌ 已禁用——会永久挂起并拖死固件服务(见 3.1 #1),直接执行下一条 attach**
@@ -101,7 +101,7 @@ PC 必须连 SENLO/2 的 AP 域(192.168.0.x)才能到达 DAP。
 
 ## 4. 开放项(执行前请补三条,或授权我按占位写法先发)
 
-1. **双路由拓扑细节**(skill §4 占位中):SENLO/2 之外另一台路由/域是什么?连错域的具体症状?
+1. **双路由拓扑细节**(skill §4 占位中):MyWiFi 之外另一台路由/域是什么?连错域的具体症状?
 2. **杀 elevated usbip 连坐**:确切表现是什么?(当前草案按保守规则"只走 detach_dap.bat 不 taskkill"落,若另有细节可补)
 3. **读回 md5 制度**:准确定义?(当前草案落成"flash_write 末行 OCDUP-RESULT 标记 + 烧前 dump 备份";若你们实践是烧后 dump+md5 归档,告诉我归档到哪)
 

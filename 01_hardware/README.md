@@ -21,7 +21,7 @@
 | PSRAM | 8 MB 嵌入,**Octal SPI** 占用 GPIO35/36/37 | 当前编译未启用;PCB 若沿用同模组,**这 3 个脚不能引出他用** |
 | Flash 接口 | QIO 四线 / 3.3V(eFuse 设定) | PCB 按四线布局,3.3V 供电 |
 | 晶振 | 40 MHz | |
-| MAC | `ac:a7:04:15:04:fc` | 出厂唯一,可用作设备标识后缀(AP SSID / mDNS) |
+| MAC | `aa:bb:cc:dd:ee:fc` | 出厂唯一,可用作设备标识后缀(AP SSID / mDNS) |
 | 原生 USB | GPIO19(D-)/20(D+) | **PCB 必须引出到 USB-C**,这是烧录 + 命令通道 |
 | USB 转串口 | 板载 CH343P | **PCB 建议省掉**:产品用不到,还能避免"CH343 口插着把芯片拽进下载模式"的坑 |
 

@@ -26,7 +26,7 @@
   - 分支 `feature/productization`(基于 v0.4.0),两个提交 `a09d72c`(v3 基线)+ `fdb730e`(构建修复)
   - **凭据外置**:真实 WiFi 密码移出仓库 → `main/wifi_credentials.h`(已 gitignore),仓库只留 `.example`;开源发布不含真实密码
   - **`build.bat`**:一键编译,绕开 Git Bash 下 idf.py 的五个坑
-  - **版本横幅**:启动打印 `=== dap-0.5.0 | mac=AC:A7:04:15:04:FC | idf=v4.4.2 ===",实机验证通过
+  - **版本横幅**:启动打印 `=== dap-0.5.0 | mac=AA:BB:CC:DD:EE:FC | idf=v4.4.2 ===",实机验证通过
   - **修掉一个静默构建缺陷**:`wifi_credentials.h` 由 `__has_include` 引入,编译器不记录"文件不存在"为依赖 → 增删该文件后增量编译不重编,表现为"改了配置却没生效"。已用 CMake `OBJECT_DEPENDS` + `build.bat` 状态检测双层修复,两方向均验证
-- [x] **硬件参数实测(2026-10-28,`esptool flash_id`)**:ESP32-S3 QFN56 rev v0.2 / **Flash 16MB** / PSRAM 8MB(未启用)/ QIO 3.3V / 40MHz 晶振 / MAC `ac:a7:04:15:04:fc`。**16MB 意味着 OTA 完全可行**,原"2MB 太紧"的顾虑来自 sdkconfig 保守值,已排除
+- [x] **硬件参数实测(2026-10-28,`esptool flash_id`)**:ESP32-S3 QFN56 rev v0.2 / **Flash 16MB** / PSRAM 8MB(未启用)/ QIO 3.3V / 40MHz 晶振 / MAC `aa:bb:cc:dd:ee:fc`。**16MB 意味着 OTA 完全可行**,原"2MB 太紧"的顾虑来自 sdkconfig 保守值,已排除
 - [x] **开发板资料确认(2026-10-28)**:板型 = **YD-ESP32-S3(ESP32-S3-WROOM-1-N16R8)**,44 脚双 USB-C,USB-UART 为 CH343P。完整 44 脚定义、与本项目的引脚对齐表见 [01_hardware/开发板资料.md](01_hardware/开发板资料.md)。**重要修正**:板载 RGB LED 是 **WS2812 接 GPIO48**(不是上游代码写的 GPIO4),必须用 RMT 驱动 → 新增 P2.5 任务;同时确认串口桥的 GPIO17/18 选择正确、CH343 在 PCB 上可省掉
