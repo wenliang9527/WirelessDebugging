@@ -25,3 +25,9 @@ _shot*.png
 
 # ===== 会话/工具私有 =====
 .zcode/
+
+# 误展开的变量名目录(实测出现过两次:某条 PowerShell 命令里
+# $env:SystemDrive 没展开,把 %SystemDrive%/ProgramData/... 整棵树
+# 落到了仓库根)。内容是无用的系统缓存,但绝不能进 git。
+%SystemDrive%/
+$env:SystemDrive/

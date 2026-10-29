@@ -400,11 +400,25 @@ class UsbipBackend:
         low = text.lower()
         return "usbip" in low or "vhci" in low
 
+    # 板子挂成本地 USB 后,设备树里的 InstanceId 形如
+    #   USB\\VID_C251&PID_F00A\\1234
+    # (实测 2026-10-29,FriendlyName = "Wireless ESP CMSIS-DAP")。
+    # 用 VID/PID 做锚,不用 FriendlyName —— 见 attached() 的说明。
+    DEVICE_ID_PATTERNS = (r"VID_C251&PID_F00A",)
+
     def attached(self) -> bool:
-        """设备当前是否已挂到本地(设备树里出现 CMSIS-DAP)。
+        """**我们这台**无线调试器当前是否已挂成本地 USB。
 
         用设备树而不是 usbip.exe port:后者要管理员才能读,而界面每次
         刷新都问一次 —— 反复弹 UAC 是不可接受的。设备树查询不需要提权。
+
+        判据必须是 VID:PID,不能只看 FriendlyName 里有没有 "CMSIS-DAP":
+        实测一台机器上同时存在 3 个名字带 CMSIS-DAP 的设备
+          USB\\VID_C251&PID_F00A\\1234           <- 我们的无线板(usbip 挂的)
+          USB\\VID_0D28&PID_0204&MI_03\\...      <- DAPLink 探针(WebUSB)
+          USB\\VID_0D28&PID_0204&MI_04\\...      <- DAPLink 探针(CMSIS-DAP v2)
+        只按名字匹配会把插着的**有线**探头当成"无线板已挂载",于是按钮永远
+        显示「卸载」,点下去反而去 detach 一个不存在的端口。
         """
         if sys.platform != "win32":
             return False
@@ -412,8 +426,9 @@ class UsbipBackend:
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command",
                  "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
-                 "Where-Object { $_.FriendlyName -match 'CMSIS-DAP' } | "
-                 "Measure-Object | Select-Object -ExpandProperty Count"],
+                 "Where-Object { $_.InstanceId -match '%s' } | "
+                 "Measure-Object | Select-Object -ExpandProperty Count"
+                 % "|".join(self.DEVICE_ID_PATTERNS)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=8,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

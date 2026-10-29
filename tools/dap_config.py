@@ -92,9 +92,13 @@ ERR_INFO: Dict[int, ErrInfo] = {
     404: ErrInfo("固件不支持这条命令",
                  "板子上的固件还是配网功能之前的老版本。",
                  "烧写 v0.7.2 或更新的固件(见 03_firmware/固件烧录指南.md)。"),
-    405: ErrInfo("设备还在启动",
-                 "板子刚上电,WiFi 还没初始化完,这个窗口期不允许切换模式。",
-                 "等 20 秒左右再点一次。"),
+    # 405 一码两义(固件 dap_cmd.c):wifi_still_starting / no_saved_networks。
+    # 两者下一步动作完全相反 —— 一个"等一会儿",一个"先去配一条网络"。
+    # 静态表只能给通用解释,精确分流见 explain_reply()。
+    405: ErrInfo("设备状态不允许",
+                "板子当前状态做不了这条命令。常见两种:①刚上电,WiFi 还在初始化;"
+                "②一条已保存网络都没有(未配网),却让它按名字置顶/连某个网。",
+                "刚上电就等 20 秒再试;如果是未配网,先扫描并连接一个 WiFi。"),
     408: ErrInfo("设备没响应",
                  "等超时了。可能是 USB 线松、板子复位了、或者正处于配网连接过程中。",
                  "确认 USB 插在板子的 native USB 口(不是 CH343 那个),然后点「刷新」重新探测。"),
@@ -111,6 +115,38 @@ ERR_UNKNOWN = ErrInfo("未知错误", "固件返回了工具不认识的错误�
 
 def explain(code: int) -> ErrInfo:
     return ERR_INFO.get(code, ERR_UNKNOWN)
+
+
+# 同一错误码可能对应多种原因(固件在 message 里区分)。按 message 精确覆盖。
+_MSG_OVERRIDE = {
+    "wifi_still_starting": ErrInfo(
+        "设备还在启动",
+        "板子刚上电,WiFi 还没初始化完,这个窗口期不允许切换模式。",
+        "等 20 秒左右再点一次。"),
+    "no_saved_networks": ErrInfo(
+        "一条网络都没保存",
+        "板子里还没有任何已保存的 WiFi(出厂或刚恢复出厂的正常状态)。",
+        "先在「配网」页扫描并连接一个 WiFi,再来这里操作。"),
+    "connect_in_progress": ErrInfo(
+        "上一条连接还在跑",
+        "板子正在连某个网络(@CONNECT 最多阻塞 25 秒),期间不接受新命令。",
+        "等它出结果(顶部状态栏会变)再试。"),
+}
+
+
+def explain_reply(code: int, text: str = "") -> ErrInfo:
+    """按 (码, 说明) 给解释 —— 有精确覆盖就用它,否则回落到码表。
+
+    为什么需要:固件把 405 同时用于"还在启动"和"没有任何已保存网络",
+    这两条的下一步动作完全相反。只看码只能给含混的通用提示。
+    """
+    msg = (text or "").strip()
+    if msg in _MSG_OVERRIDE:
+        return _MSG_OVERRIDE[msg]
+    for key, info in _MSG_OVERRIDE.items():
+        if key in msg:
+            return info
+    return explain(code)
 
 
 # ====================================================================== #
@@ -1103,6 +1139,21 @@ def run_selftest() -> int:
     expect_eq("201 标题", explain(201).title, "找不到这个 WiFi")
     expect_eq("409 有 STA 提示", "STA" in explain(409).action, True)
     expect_eq("未知码兜底", explain(999).title, "未知错误")
+
+    # 405 一码两义:必须按 message 分流,否则用户会被指去做错的事
+    e_start = explain_reply(405, "wifi_still_starting")
+    e_nonet = explain_reply(405, "no_saved_networks")
+    check("405 + wifi_still_starting -> 让用户等一会儿",
+          "等" in e_start.action, e_start.action)
+    check("405 + no_saved_networks -> 让用户先去配网",
+          "配" in e_nonet.action or "连接" in e_nonet.action, e_nonet.action)
+    check("两条 405 给的动作不一样", e_start.action != e_nonet.action,
+          "%r vs %r" % (e_start.action, e_nonet.action))
+    check("无 message 覆盖时回落码表",
+          explain_reply(409, "scan_requires_STA_mode").title == explain(409).title, "")
+    check("explain_reply 能接受带参数的 message",
+          explain_reply(423, "connect_in_progress") is _MSG_OVERRIDE["connect_in_progress"],
+          "")
     expect_eq("信号条 -48", rssi_bar(-48), "\u25a0\u25a0\u25a0\u25a0")
     expect_eq("信号条 -90", rssi_bar(-90), "\u25a1\u25a1\u25a1\u25a1")
     expect_eq("信号条 -70 两格", rssi_bar(-70), "\u25a0\u25a0\u25a1\u25a1")
@@ -1375,20 +1426,47 @@ def run_selftest() -> int:
         # 曾经的 bug:start() 把 self.on_line 换成 _pump_wrap,stop() 不复原;
         # 第二次 start() 时 _user_on_line 取到的就是 _pump_wrap 自己,
         # 每行日志无限递归 → RecursionError 被吞 → 日志页永久静默。
-        # 不真起进程(openocd 可能没装):只复现 start() 里装回调那两步。
+        #
+        # **必须真的走 start()**,不能手抄 start() 里那两行去"模拟":
+        # 上一版就是这么写的,结果把 start() 改回 bug 版后自测依然全绿
+        # (假绿)。这里把 exe 换成 cmd.exe(Windows 一定有)真起进程,
+        # 反复启停三轮,断言的正是 start() 自己的行为。
         lines = []
         oc = B.OpenOcdBackend("dap.local", on_line=lines.append,
                               flavor="usbip", scripts_dir=None)
-        for _ in range(3):        # 模拟反复点「启动」
-            if not oc._user_captured:
-                oc._user_on_line = oc.on_line
-                oc._user_captured = True
-            oc.on_line = oc._pump_wrap
+        import os as _os
+        oc.exe = _os.path.join(_os.environ.get("SystemRoot", r"C:\Windows"),
+                               "System32", "cmd.exe")
+        oc.args = ["/c", "echo Info : Listening on port 3333 for gdb connections"]
+        oc.cwd = None
+        real = sys.platform == "win32" and _os.path.isfile(oc.exe)
+        if real:
+            for _ in range(3):          # 模拟反复点「启动」/进程自己退出后再点
+                oc.start()
+                time.sleep(0.4)
+                oc.stop()
+            oc.start()
+            time.sleep(0.4)
+            check("反复 start 后 _user_on_line 仍是用户回调(不是包装自己)",
+                  oc._user_on_line is not oc._pump_wrap,
+                  "_user_on_line=%r" % (oc._user_on_line,))
+            try:
+                oc._pump_wrap("普通一行")
+                check("反复 start 后日志回调不自递归", True, "")
+            except RecursionError:
+                check("反复 start 后日志回调不自递归", False, "RecursionError")
+            oc.stop()
+        else:
+            # 非 Windows:起不了进程,退化成只验证"包装不会套包装"
+            oc.start = lambda: None          # 不真起
+            for _ in range(3):
+                if not oc._user_captured:
+                    oc._user_on_line = oc.on_line
+                    oc._user_captured = True
+                oc.on_line = oc._pump_wrap
+            check("反复 start 后 _user_on_line 仍是用户回调(不是包装自己)",
+                  oc._user_on_line is not oc._pump_wrap, "")
         oc._pump_wrap("Listening on port 3333 for gdb connections")
-        oc._pump_wrap("普通一行")
-        check("日志回调重复 start 后仍只回调一次",
-              lines.count("普通一行") == 1,
-              "lines=%r" % (lines,))
         check("gdb 端口嗅探仍生效", oc.gdb_ready() is True, "")
 
         # --- 回归:超时后的迟到帧不能串到下一条命令 -------------------
@@ -1403,6 +1481,14 @@ def run_selftest() -> int:
               info is not None and getattr(info, "fw", None) is not None,
               "got=%r" % (info,))
         c.close()
+
+        # --- 回归:usbip 驱动缓存必须可失效 ---------------------------
+        # 曾经的坑:驱动状态"进程内只查一次",用户在界面上被提示去装驱动,
+        # 装完回来仍是"驱动未装",只能重启工具。
+        check("_usbip_driver_cached 支持 force 重新检测",
+              "force" in App._usbip_driver_cached.__code__.co_varnames,
+              str(App._usbip_driver_cached.__code__.co_varnames))
+        check("有 _recheck_usbip 入口", hasattr(App, "_recheck_usbip"), "")
 
         # --- 回归:串口 hwid 预筛 -------------------------------------
         check("DAP 的 VID:PID 能被识别",
@@ -1495,7 +1581,7 @@ def run_raw(port: Optional[str], line: str, timeout: float,
         if reply.ok:
             print("  @OK " + reply.text)
         else:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             print("  @ERR %d %s" % (reply.code, reply.text))
             print("  -> %s:%s" % (info.title, info.detail))
         return 0 if reply.ok else 1
@@ -2058,6 +2144,12 @@ class App:
 
             self._backend_rows[key] = {"state": state, "btn": btn,
                                        "copy": copy_btn}
+            if key == "usbip":
+                # 用户会被提示"去装 usbip 驱动",装完必须能立刻刷出结果 ——
+                # 没有这个按钮就只能重启工具(驱动状态有缓存)。
+                ttk.Button(row, text="重新检测", width=10,
+                           command=self._recheck_usbip).pack(
+                    side="right", padx=(0, 8))
 
         # OpenOCD 的 target 选择 —— 没有这个选项的话,用户不知道该连什么芯片
         trow = tk.Frame(tab, bg=self.C_CARD)
@@ -2101,11 +2193,29 @@ class App:
         self._refresh_backends()
 
     # --- 调试接入页的行为 ---------------------------------------------
-    def _usbip_driver_cached(self, ub) -> bool:
-        """驱动装没装 —— 按进程缓存一次(pnputil 每次 250-300ms)。
+    def _recheck_usbip(self) -> None:
+        """「重新检测」:作废两个缓存并立刻重跑一次后台探测。
 
-        驱动状态在进程生命周期内不会变(用户装完会重启工具),缓存安全。
+        这是驱动状态的唯一刷新入口 —— 用户在别的窗口装完驱动回来点这个,
+        马上就能看到「驱动已装」,不必重启工具。
         """
+        self._usbip_driver_state = None
+        self._usbip_reach_result = None
+        self._usbip_attached_state = None
+        self._usbip_attached_ts = 0.0
+        self._log("重新检测 usbip 驱动与设备状态…", "sys")
+        self._refresh_backends()
+
+    def _usbip_driver_cached(self, ub, force: bool = False) -> bool:
+        """驱动装没装 —— 缓存结果(pnputil 每次 250-300ms)。
+
+        缓存必须有失效手段:用户正是在这个界面上被提示"去装驱动",装完
+        回来了必须能立刻看到变化。原实现"进程内只查一次"会让用户装完
+        驱动后仍被拦在"驱动未装",只能重启工具 —— 所以这里给 force,
+        由「USB 桥接」卡片上的「重新检测」按钮触发。
+        """
+        if force:
+            self._usbip_driver_state = None
         if self._usbip_driver_state is None:
             try:
                 self._usbip_driver_state = bool(ub.driver_installed())
@@ -2407,7 +2517,7 @@ class App:
             else:
                 # 烧 AT32 的前提是设备已经挂成本地 USB。没挂就直接起,
                 # OpenOCD 会报"no adapter found",用户看不出是桥接没做。
-                if not bm.usbip.driver_installed():
+                if not self._usbip_driver_cached(bm.usbip):
                     self._show_result(
                         "还没装 usbip 驱动。AT32 烧录的顺序是:\n\n"
                         "  1. 装 usbip 驱动(上面的 USB 桥接卡片)\n"
@@ -2447,18 +2557,37 @@ class App:
                         "卸载驱动:uninstall_driver.bat" % bm.usbip.root, "warn")
                 return
 
-            if bm.usbip.attached():
+            # 用缓存值而不是同步查设备树:attached() 要起一次 PowerShell,
+            # 实测 1.1-2.0s,放在按钮点击里就是"点了没反应"。缓存值由
+            # _refresh_backends 的后台线程维护(3s TTL),点按钮时最多差 3 秒。
+            if self._usbip_attached_state:
                 ok, msg = bm.usbip.detach_all()
                 self._log(msg, "ok" if ok else "err")
                 if not ok:
                     self._show_result(msg, "err")
+                # 两个缓存都要立刻作废:否则 3 秒内按钮还显示「卸载」,
+                # 用户会以为没卸掉而再点一次。
+                self._usbip_attached_state = False
+                self._usbip_attached_ts = time.monotonic()
+                self._usbip_reach_result = None
                 self.root.after(1200, self._refresh_backends)
-                self._usbip_reach_result = None   # 状态变了,缓存作废
                 return
 
             # 挂载前先确认设备真的可达。usbip 自己超时很难懂,而"不同网段"
             # 是最常见的原因 —— 提前拦下来说清楚。
-            ok_r, msg_r = bm.usbip.reachable(timeout=2.5)
+            # 但 reachable() 在 dap.local 解析失败时要 3.0-3.35s,不能同步卡 UI:
+            # 先用缓存;缓存没有(或已过期)就起后台探测,并提示用户再点一次。
+            cached = self._usbip_reach_cached()
+            if cached is None:
+                self._usbip_probe_async(bm.usbip)
+                self._log("正在探测设备连通性,请稍候再点一次「挂载」", "sys")
+                self._show_result(
+                    "正在探测设备能不能连上(最多 3 秒),结果出来后再点一次"
+                    "「挂载」。\n\n"
+                    "为什么要先探:usbip 自己超时给的错误很难懂,而\"PC 和设备"
+                    "不在同一网段\"是最常见的原因。", "info")
+                return
+            ok_r, msg_r = cached
             if not ok_r:
                 self._log("设备不可达,取消挂载", "err")
                 self._show_result(msg_r, "err")
@@ -2466,8 +2595,12 @@ class App:
             ok, msg = bm.usbip.attach()
             self._log(msg, "ok" if ok else "err")
             self._show_result(msg, "ok" if ok else "warn")
-            # 挂载是异步的(提权后新起进程),等设备树出现再刷新按钮文案
+            # 挂载是异步的(提权后新起进程),等设备树出现再刷新按钮文案。
+            # 必须把 attached 缓存打旧:否则 2.5s 后那次刷新仍在 3s TTL 内,
+            # 不会重新探测,按钮就一直停在「挂载」——用户以为没挂上又点一次。
+            self._usbip_attached_ts = 0.0
             self.root.after(2500, self._refresh_backends)
+            self.root.after(5000, self._refresh_backends)
             return
 
     def _poll_openocd_ready(self, tries: int = 0, key: str = "openocd") -> None:
@@ -2842,7 +2975,7 @@ class App:
         if err is not None:
             if isinstance(err, DapError):
                 r = err.reply
-                info = r.info
+                info = explain_reply(r.code, r.text)
                 self._show_result(
                     "扫描失败(%d %s)\n\n%s\n%s\n\n下一步:%s"
                     % (r.code, r.text, info.title, info.detail, info.action), "err")
@@ -2930,7 +3063,7 @@ class App:
             return
         assert isinstance(reply, Reply)
         if not reply.ok:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             self._show_result(
                 "连接「%s」失败:%s\n\n"
                 "%s\n\n"
@@ -3070,7 +3203,7 @@ class App:
             return
         assert isinstance(reply, Reply)
         if not reply.ok:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             self._show_result("切换失败:%s\n\n%s\n\n下一步:%s\n\n技术细节:%d %s"
                               % (info.title, info.detail, info.action,
                                  reply.code, reply.text), "err")
@@ -3183,7 +3316,7 @@ class App:
             return
         assert isinstance(reply, Reply)
         if not reply.ok:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             self._show_result("设置固定优先失败:%s\n\n%s\n下一步:%s"
                               % (info.title, info.detail, info.action), "err")
             return
@@ -3220,7 +3353,7 @@ class App:
             return
         assert isinstance(reply, Reply)
         if not reply.ok:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             self._show_result("删除失败:%s\n\n%s\n下一步:%s"
                               % (info.title, info.detail, info.action), "err")
             return
@@ -3253,7 +3386,7 @@ class App:
             return
         assert isinstance(reply, Reply)
         if not reply.ok:
-            info = reply.info
+            info = explain_reply(reply.code, reply.text)
             self._show_result("置顶失败:%s\n\n%s\n下一步:%s"
                               % (info.title, info.detail, info.action), "err")
             return

@@ -142,8 +142,8 @@ LICENSE_SUMMARY = """\
   atopenocd                 GPL-2      OpenOCD 雅特力 fork(AT32 烧录)
 
 各组件的许可证全文见 tools/<组件>/ 目录(COPYING 或 源码获取.txt)。
-GPL-2 组件以独立进程运行、经标准接口(命令行/网络)与本工具通信,
-依据 GPL 与 FSF 惯例,该使用方式不使本工具成为衍生作品。
+GPL-2.0 / GPL-3.0 组件以独立进程运行、经标准接口(命令行/网络)与本工具
+通信,依据 GPL 与 FSF 惯例,该使用方式不使本工具成为衍生作品。
 
 固件基于 windowsair/esp8266-dap(MIT),经二次开发,版权声明见固件包内
 LICENSE 文件。乐鑫 flash_download_tool 为乐鑫专有软件,本包不含;
@@ -225,6 +225,15 @@ def assemble(pkg_root: str) -> None:
                 os.path.join("partition_table", "partition-table.bin")):
         shutil.copyfile(os.path.join(SRC_FIRMWARE, rel),
                         os.path.join(fw, os.path.basename(rel)))
+    # 固件是 MIT(继承 windowsair),MIT 的唯一义务就是"副本里保留版权声明
+    # 和许可声明"。LICENSE_SUMMARY 也写着"版权声明见固件包内 LICENSE 文件",
+    # 所以这份必须真的进包 —— 原实现漏了,交付包里的 firmware/ 没有 LICENSE。
+    fw_license = os.path.join(SRC_FIRMWARE, "..", "LICENSE")
+    fw_license = os.path.normpath(fw_license)
+    if os.path.isfile(fw_license):
+        shutil.copyfile(fw_license, os.path.join(fw, "LICENSE"))
+    else:
+        print("  [警告] 找不到固件 LICENSE:%s" % fw_license)
     shutil.copyfile(SRC_FIRMWARE_DOCS, os.path.join(fw, "固件烧录指南.md"))
     shutil.copyfile(SRC_MANUAL, os.path.join(pkg_root, "快速上手.md"))
     with open(os.path.join(pkg_root, "许可与开源声明.txt"), "w",
@@ -241,6 +250,86 @@ def assemble(pkg_root: str) -> None:
             "3. 调试接入在「调试接入」页:Keil / OpenOCD / AT32 烧录三张卡片\n\n"
             "首次运行 Windows 可能弹 SmartScreen:点「更多信息」→「仍要运行」。\n"
             "如果杀毒软件拦截,添加信任即可(工具不联网上传任何数据)。\n")
+
+
+def _builtin_firmware_literals(main_dir: str) -> set:
+    """固件源码里**本来就有**的字符串字面量(不含 wifi_credentials.h)。
+
+    用来区分"用户自己的 WiFi 凭据"和"固件内置常量":
+      AP 热点密码 12345678 写在 wifi_handle.c 的 #define 里,
+      mDNS / 版本横幅里的 "dap"、"DAP"、"OTA" 同理。
+    这些出现在 bin 里是正常的,不能报成凭据泄露。
+    """
+    import re as _re
+    lits = set()
+    try:
+        names = os.listdir(main_dir)
+    except Exception:
+        return lits
+    for name in names:
+        if not name.endswith((".c", ".h")) or name == "wifi_credentials.h":
+            continue
+        try:
+            text = open(os.path.join(main_dir, name), encoding="utf-8",
+                        errors="replace").read()
+        except Exception:
+            continue
+        for m in _re.finditer(r'"([^"\\\n]{3,})"', text):
+            lits.add(m.group(1))
+    return lits
+
+
+def check_no_credentials(fw_bin: str) -> list:
+    """确认要发出去的固件 bin 里**不含**本机私有 WiFi 凭据。
+
+    为什么必须有这一步:main/wifi_credentials.h 是 gitignore 的本地文件,
+    编译时经 __has_include 编进 bin。开发机上一次"带着自己家 WiFi 编"的
+    产物会被 assemble() 原样抓进交付包 —— 那就等于把家里的 SSID/密码
+    随软件发给所有人。这类事故无法靠 code review 发现,只能机器校验。
+
+    判据:凭据文件里的每个 SSID/密码,若**不在**固件其余源码的字面量集合里
+    (即它是这个文件独有的,也就是用户私有的),就不许出现在 bin 里。
+    这样 12345678(AP 热点密码)、DAP/OTA(内置常量)不会被误报。
+
+    返回问题列表(空 = 干净)。找不到凭据文件时跳过(交付机上通常没有)。
+    """
+    problems = []
+    main_dir = os.path.normpath(os.path.join(SRC_FIRMWARE, "..", "main"))
+    cred = os.path.join(main_dir, "wifi_credentials.h")
+    if not os.path.isfile(cred) or not os.path.isfile(fw_bin):
+        return problems
+    try:
+        text = open(cred, encoding="utf-8", errors="replace").read()
+    except Exception:
+        return problems
+    import re as _re
+    builtin = _builtin_firmware_literals(main_dir)
+    secrets = []
+    for m in _re.finditer(r'\.ssid\s*=\s*"([^"]*)"', text):
+        secrets.append(m.group(1))
+    for m in _re.finditer(r'\.password\s*=\s*"([^"]*)"', text):
+        secrets.append(m.group(1))
+    blob = open(fw_bin, "rb").read()
+    def _is_builtin(s: str) -> bool:
+        """s 是否其实是固件自带的东西。
+
+        不能只做"完全相等"比较 —— 实测 "DAP" 单看不在字面量集合里,但它是
+        "DAP-"(组装 AP 热点名)和 "DAP mDNS" 的子串,bin 里当然会有;
+        "OTA" 同理是 "corsacOTA" 的子串;"12345678" 则完全等于 AP_PASSWORD。
+        所以按"是某个内置字面量的子串,或内置字面量是它的子串"来判。
+        """
+        if s in builtin:
+            return True
+        return any(s in b or b in s for b in builtin if len(b) >= 3)
+
+    for s in secrets:
+        if len(s) < 3 or _is_builtin(s):
+            continue      # 太短 / 固件内置常量,不是私有凭据
+        if s.encode("utf-8") in blob:
+            problems.append(
+                "固件 bin 里含本机私有凭据 %r —— 请先删掉 main/wifi_credentials.h "
+                "重新编译再打包(否则会随交付包泄露)" % s)
+    return problems
 
 
 def smoke_check(pkg_root: str) -> None:
@@ -264,6 +353,9 @@ def smoke_check(pkg_root: str) -> None:
     for f in ("bootloader.bin", "wireless_esp_dap.bin"):
         if not os.path.isfile(os.path.join(pkg_root, "firmware", f)):
             problems.append("缺 firmware/" + f)
+    # 固件 MIT 的版权声明必须随包(见 assemble 里的说明)
+    if not os.path.isfile(os.path.join(pkg_root, "firmware", "LICENSE")):
+        problems.append("缺 firmware/LICENSE(固件 MIT 版权声明)")
     for f in ("快速上手.md", "许可与开源声明.txt", "README.txt"):
         if not os.path.isfile(os.path.join(pkg_root, f)):
             problems.append("缺 " + f)
@@ -290,6 +382,10 @@ def smoke_check(pkg_root: str) -> None:
                 if want not in head:
                     problems.append(
                         "tools/%s/COPYING 版本不符(应为 %s)" % (name, lic))
+    # 最后一道:不许把本机私有 WiFi 凭据随包发出去(见 check_no_credentials)。
+    # 和上面的结构检查合并成一次报错,免得用户改一处跑一次。
+    problems += check_no_credentials(
+        os.path.join(pkg_root, "firmware", "wireless_esp_dap.bin"))
     if problems:
         for p in problems:
             print("  !! " + p)
