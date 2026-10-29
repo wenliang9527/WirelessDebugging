@@ -73,7 +73,7 @@ python dap_config.py --port COM18     指定串口(跳过自动探测)
 python dap_config.py --mock           连假设备,没有板子也能试界面
 python dap_config.py --list           只枚举+探测串口,不开界面
 python dap_config.py --raw "@SCAN"    直接发一条命令看响应
-python dap_config.py --selftest       无硬件自测(100 项)
+python dap_config.py --selftest       无硬件自测(121 项)
 ```
 
 `--mock` 和 `--raw` 可以组合:`python dap_config.py --mock --raw "@SCAN"`。
@@ -122,3 +122,54 @@ python capture_boot.py
 ```
 
 端口和时长在文件头的 `PORT` / `DURATION` 常量里改。
+
+---
+
+## build_package.py —— 一键打交付包
+
+把 GUI(exe)、第三方工具、固件、文档组装成一个可直接发给同事的目录:
+
+```bat
+pip install -r requirements.txt      # 首次:装 pyserial / pyinstaller / pillow
+python build_package.py              # 产物在 tools/dist/无线调试器/
+python build_package.py --skip-exe   # 只重组工具目录,不重跑 PyInstaller
+```
+
+产物结构:
+
+```
+无线调试器/
+├─ 无线调试器.exe            PyInstaller --onedir(--console 保留,排错要看日志)
+├─ tools/
+│  ├─ elaphureLink/                     BSD-2(Keil 插件)
+│  ├─ openocd-elaphurelink/v0.4.0/      GPL-2(独立进程)
+│  ├─ usbip-win/                        GPL-3.0(独立进程)
+│  │  ├─ install_driver.bat             驱动安装(界面会让用户来这个目录点)
+│  │  ├─ uninstall_driver.bat
+│  │  └─ v0.3.6-dev/                    usbip.exe 本体
+│  └─ atopenocd/                        GPL-2(雅特力 fork,349 个 target)
+├─ firmware/                  固件 bin + 烧录指南
+├─ 快速上手.md
+└─ 许可与开源声明.txt
+```
+
+`smoke_check()` 会校验上述结构,包括 `install_driver.bat` 和每个 GPL 目录下的
+`COPYING` 全文(并核对 GPL 版本号)。许可证全文源文件在 `tools/licenses/`。
+
+> `flash_download_tool` 是乐鑫的专有软件,绝不入包。
+
+## _shot.py —— 截图辅助(开发期)
+
+```bat
+python _shot.py
+```
+
+依赖 `pillow`。
+
+## requirements.txt
+
+| 依赖 | 谁需要 | 说明 |
+| --- | --- | --- |
+| pyserial>=3.4 | 主程序 | 串口通信;`--selftest` 不需要 |
+| pyinstaller>=5.0 | build_package.py | 打 exe |
+| pillow>=9.0 | _shot.py | 截图 |

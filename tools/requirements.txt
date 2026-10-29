@@ -1,0 +1,17 @@
+# 无线调试器 PC 工具 —— 运行时依赖
+#
+# 主程序(dap_config.py / dap_backends.py / build_package.py)只需要 pyserial。
+# 其余是开发期辅助脚本用到的,按需装。
+#
+#   pip install -r requirements.txt
+
+# 主程序:串口通信(DapClient、SerialTransport、probe_port)
+pyserial>=3.4
+
+# 打包交付包(build_package.py)。装它会连带装 pyserial。
+pyinstaller>=5.0
+
+# 以下仅开发期辅助脚本需要:
+#   _shot.py        截图(PIL)
+#   capture_boot.py 抓启动日志(pyserial,已含在上面)
+pillow>=9.0

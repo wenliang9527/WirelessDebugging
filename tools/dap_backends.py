@@ -2,7 +2,7 @@
 
 设计原则(为什么这么写):
 
-1. **不把第三方代码编进本程序**。OpenOCD 与 usbip-win 是 GPL-2,elaphureLink
+1. **不把第三方代码编进本程序**。OpenOCD 是 GPL-2、usbip-win 是 GPL-3.0,elaphureLink
    是 BSD-2 —— 本模块只做 subprocess 调度,从不 import 它们的任何代码,因此
    本程序不是它们的衍生作品,可以闭源分发。代价是它们必须以独立目录随包提供,
    并各自附带许可证(见 tools/*/COPYING)。
@@ -216,6 +216,8 @@ class OpenOcdBackend(Backend):
         self.scripts_dir = scripts_dir
         self._saw_gdb_port = False
         self._user_on_line: Optional[Callable[[str], None]] = on_line
+        # 用于区分"还没捕获用户回调"和"用户回调本来就是 None"
+        self._user_captured = False
 
         if flavor == "usbip":
             # 雅特力 fork:走本地 USB(usbip 挂载出来的 CMSIS-DAP),
@@ -253,9 +255,21 @@ class OpenOcdBackend(Backend):
 
         不能把包装值写回 self.on_line 再在包装里调 self.on_line —— 那会
         自己调自己,首行就无限递归。
+
+        重复 start(界面上双击「启动」,或者 openocd 自己退出后再点一次)
+        时必须仍然拿到**用户**的回调,而不是上一次装上去的 _pump_wrap:
+        _pump_wrap 里调 self._user_on_line,如果 _user_on_line 又是
+        _pump_wrap,每来一行日志就无限递归,RecursionError 被
+        Backend._pump 的 except 吞掉 —— 表现是日志页从此永久静默
+        (而那正是界面在报错时让用户去看的地方)。
         """
         self._saw_gdb_port = False
-        self._user_on_line = self.on_line
+        # 只在第一次(start 之前)从 self.on_line 取值;后续 start 复用
+        # 已保存的原始回调。用 _user_captured 标志而不是 `or self.on_line`,
+        # 因为用户回调可能合法地就是 None。
+        if not self._user_captured:
+            self._user_on_line = self.on_line
+            self._user_captured = True
         self.on_line = self._pump_wrap
         super().start()
 
@@ -385,6 +399,31 @@ class UsbipBackend:
                 continue
         low = text.lower()
         return "usbip" in low or "vhci" in low
+
+    def attached(self) -> bool:
+        """设备当前是否已挂到本地(设备树里出现 CMSIS-DAP)。
+
+        用设备树而不是 usbip.exe port:后者要管理员才能读,而界面每次
+        刷新都问一次 —— 反复弹 UAC 是不可接受的。设备树查询不需要提权。
+        """
+        if sys.platform != "win32":
+            return False
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+                 "Where-Object { $_.FriendlyName -match 'CMSIS-DAP' } | "
+                 "Measure-Object | Select-Object -ExpandProperty Count"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return False
+        try:
+            return int((res.stdout or b"0").decode("utf-8", "replace").strip() or 0) > 0
+        except Exception:
+            return False
 
     def attach(self) -> tuple:
         """提权挂载。返回 (ok, message)。

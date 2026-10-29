@@ -10,14 +10,13 @@ dumps/
 # ===== 构建产物 =====
 __pycache__/
 *.pyc
+# 交付包不入 git:86MB,随时可用 build_package.py 重建
 tools/dist/
-tools/_build/
 
-# ===== 大型二进制(历史遗留的读回/烧录镜像,不含凭据但没必要进 git)=====
+# ===== 大型二进制(固件/读回/烧录镜像)=====
+# 注意:不要再写 "!tools/dist/**" 之类的反向规则 —— 目标目录本身已被
+# tools/dist/ 整体忽略,反向包含对它无效,只会让规则自相矛盾。
 *.bin
-!tools/dist/**
-# 交付包不入 git(86MB,随时可用 build_package.py 重建)
-tools/dist
 
 # ===== 日志与临时 =====
 build_log*.txt

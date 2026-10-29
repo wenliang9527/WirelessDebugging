@@ -644,18 +644,15 @@ class DapClient:
           2. 发 STATUS 直到能拿到可信状态,才算真正就绪。
         """
         deadline = time.monotonic() + timeout
-        # 阶段一:只读不写,等命令通道就绪标志。
+        # 阶段一:等命令通道就绪。
         # 两条出路:启动横幅出现(开串口踹复位了,老路径),或者 PING 直接
         # 应答(DTR 修复后开串口不再复位,板子本来就在跑,横幅不会重来)。
-        banner_seen = False
         while time.monotonic() < deadline:
             if b"command channel ready" in self._seen_log:
-                banner_seen = True
                 break
             r = self._request_once("@PING", 0.6)
             if r.ok and parse_ping(r.text):
                 self.info = parse_ping(r.text)
-                banner_seen = True
                 break
             time.sleep(0.15)
         # 阶段二:稀疏轮询 STATUS,直到 WiFi 基座可用
@@ -696,11 +693,6 @@ class DapClient:
             self._tr.close()
         except Exception:
             pass
-
-    def reconnect(self) -> None:
-        self.close()
-        time.sleep(0.2)
-        self.open()
 
     # --- 读线程 ------------------------------------------------------
     def _read_loop(self) -> None:
@@ -779,6 +771,18 @@ class DapClient:
         with self._lock:
             if not self._tr.is_open:
                 return Reply(ok=False, code=408, text="port_closed")
+            # 写命令前先排空未读帧。上一条命令超时(408)时它的应答仍可能
+            # 迟到,留在队列里会被本条命令当成自己的结束帧:
+            #   @STATUS 超时 → 迟到的 "@OK mode=STA ..." 被 scan() 当成
+            #   SCAN 的结束帧 → 扫描返回 0 个网络;
+            #   @CONNECT 超时 → 迟到的 "connected ssid=... ip=..." 被
+            #   下一条 @STATUS 吃掉 → 报「状态格式不认识」。
+            # 固件侧命令是串行的,写之前队列里的一切都属于过去,丢弃安全。
+            while True:
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    break
             try:
                 self._tr.write((line.rstrip("\r\n") + "\n").encode("utf-8"))
             except Exception as exc:
@@ -813,13 +817,6 @@ class DapClient:
                         except Exception:
                             pass
                 # 其他未知 '@' 行直接忽略
-
-    def send_async(self, line: str) -> None:
-        """只发不等(用于 @REBOOT / @FACTORY 之后马上断连的场景)。"""
-        try:
-            self._tr.write((line.rstrip("\r\n") + "\n").encode("utf-8"))
-        except Exception:
-            pass
 
     # --- 高层命令 ----------------------------------------------------
     def ping(self, timeout: float = 2.0) -> DeviceInfo:
@@ -913,8 +910,36 @@ class DapError(Exception):
 # 串口枚举 / 探测
 # ====================================================================== #
 
-def enumerate_ports() -> List[Tuple[str, str]]:
-    """列出所有串口 -> [(device, description)]。"""
+# ESP32-S3 的 USB-Serial/JTAG 的 USB 标识。板子跑应用时也枚举成这个
+# (不是只有下载模式),所以它只能用来**加快筛选**,不能当作"一定是"。
+DAP_USB_VID_PID = ("303A", "1001")
+
+
+def _is_likely_dap_port(hwid: str) -> bool:
+    """hwid 里是否带 ESP32-S3 USB-Serial/JTAG 的 VID:PID。
+
+    两种常见写法都要认:
+      pyserial 在 Windows 给的是 "USB VID:PID=303A:1001 SER=..."
+      设备路径形态是 "USB\\VID_303A&PID_1001\\..."
+    """
+    h = (hwid or "").upper().replace(" ", "")
+    if not h:
+        return False
+    vid, pid = DAP_USB_VID_PID
+    return (("VID:PID=%s:%s" % (vid, pid)) in h
+            or ("VID_%s&PID_%s" % (vid, pid)) in h)
+
+
+def enumerate_ports(with_hwid: bool = False):
+    """列出串口。
+
+    with_hwid=False -> [(device, description)](老接口,保持不变)
+    with_hwid=True  -> [(device, description, hwid)]
+
+    为什么要 hwid:探测一个非 DAP 的口要 6 秒左右(打开端口 + 等启动),
+    而 hwid 里直接写着 USB VID:PID —— 带 303A:1001 的才可能是 DAP,
+    其余的一眼就能跳过。自动探测从「端口数 × 6s」降到秒级。
+    """
     try:
         from serial.tools import list_ports
     except Exception:
@@ -922,17 +947,22 @@ def enumerate_ports() -> List[Tuple[str, str]]:
     out = []
     for p in list_ports.comports():
         desc = p.description or ""
-        out.append((p.device, desc))
+        if with_hwid:
+            out.append((p.device, desc, getattr(p, "hwid", "") or ""))
+        else:
+            out.append((p.device, desc))
     out.sort(key=lambda x: (len(x[0]), x[0]))
     return out
 
 
 def probe_port(device: str, timeout: float = 1.5,
-               settle: float = 2.5) -> Optional[DeviceInfo]:
+               settle: float = 0.0) -> Optional[DeviceInfo]:
     """往一个串口发 @PING,回 pong 就是我们的设备。
 
-    打开串口会让 ESP32-S3 复位,所以先等它起来(wait_ready 内部轮询)。
-    settle 保留作为额外静置,给刚复位完的板子一点余量。
+    打开串口会让 ESP32-S3 复位,先等它起来 —— wait_ready 内部本来就在
+    轮询 PING(每 0.15s,直到 timeout),外面再 sleep 就是纯浪费。
+    实测(2026-10-29)探测一个非 DAP 的 COM 口:settle=2.5 时 6.34s,
+    settle=0 时约 3.8s(剩下的都是 wait_ready 的超时)。默认已改为 0。
     """
     client = DapClient(SerialTransport(device))
     try:
@@ -955,16 +985,28 @@ def probe_port(device: str, timeout: float = 1.5,
             pass
 
 
-def probe_all(progress: Optional[Callable[[str, str], None]] = None
+def probe_all(progress: Optional[Callable[[str, str], None]] = None,
+              use_hwid_filter: bool = True
               ) -> List[Tuple[str, DeviceInfo]]:
     """探测所有串口。
 
     串口枚举里常见蓝牙虚拟串口、CH343 之类的杂项口,对它们写数据可能让
-    驱动层出问题(实测遇到过一次 process 段错误)。所以逐个探测之间留点
-    间隔,并把单个口的异常彻底吞掉,绝不让一个坏口搞死整个探测。
+    驱动层出问题(实测遇到过一次 process 段错误)。所以:
+      - use_hwid_filter 时先按 hwid 里的 ESP32-S3 VID:PID 预筛;
+      - 逐个探测之间留 0.2s 间隔,单个口的异常彻底吞掉。
+
+    预筛只是**加速**:若一个都没匹配上(比如板子用了别的 USB 转串口芯片,
+    或者 hwid 拿不到),自动退回全量探测,不会漏设备。
     """
+    ports = enumerate_ports(with_hwid=True)
+    if use_hwid_filter:
+        likely = [p for p in ports if _is_likely_dap_port(p[2])]
+        if likely:
+            ports = likely
+        # 一个都不匹配就保留全量 —— 宁可慢也不能漏
+
     found = []
-    for device, desc in enumerate_ports():
+    for device, desc, _hwid in ports:
         if progress:
             progress(device, desc)
         try:
@@ -1328,6 +1370,51 @@ def run_selftest() -> int:
         ok_bad, msg_bad = ub3.reachable(timeout=0.5)
         check("不可达地址返回失败", ok_bad is False, "")
         check("不可达时提示网段问题", "网段" in msg_bad, msg_bad[:40])
+
+        # --- 回归:OpenOCD 日志回调不能自递归 -------------------------
+        # 曾经的 bug:start() 把 self.on_line 换成 _pump_wrap,stop() 不复原;
+        # 第二次 start() 时 _user_on_line 取到的就是 _pump_wrap 自己,
+        # 每行日志无限递归 → RecursionError 被吞 → 日志页永久静默。
+        # 不真起进程(openocd 可能没装):只复现 start() 里装回调那两步。
+        lines = []
+        oc = B.OpenOcdBackend("dap.local", on_line=lines.append,
+                              flavor="usbip", scripts_dir=None)
+        for _ in range(3):        # 模拟反复点「启动」
+            if not oc._user_captured:
+                oc._user_on_line = oc.on_line
+                oc._user_captured = True
+            oc.on_line = oc._pump_wrap
+        oc._pump_wrap("Listening on port 3333 for gdb connections")
+        oc._pump_wrap("普通一行")
+        check("日志回调重复 start 后仍只回调一次",
+              lines.count("普通一行") == 1,
+              "lines=%r" % (lines,))
+        check("gdb 端口嗅探仍生效", oc.gdb_ready() is True, "")
+
+        # --- 回归:超时后的迟到帧不能串到下一条命令 -------------------
+        # 用 MockTransport 直接喂一个"上一条命令的迟到应答",验证
+        # _request_once 写命令前会排空队列。
+        mt = MockTransport(connect_delay=0.0)
+        c = DapClient(mt)
+        c.open()
+        c._frames.put("@OK mode=STA ssid=迟到帧 ip=1.2.3.4")  # 冒充残留
+        info = c.ping(timeout=2.0)
+        check("残留帧不影响下一条命令",
+              info is not None and getattr(info, "fw", None) is not None,
+              "got=%r" % (info,))
+        c.close()
+
+        # --- 回归:串口 hwid 预筛 -------------------------------------
+        check("DAP 的 VID:PID 能被识别",
+              _is_likely_dap_port("USB VID:PID=303A:1001 SER=AC:A7"),
+              "")
+        check("非 DAP 的串口不会被误判",
+              not _is_likely_dap_port("USB VID:PID=1A86:55D3 SER=5C36"),
+              "")
+        check("空 hwid 不误判", not _is_likely_dap_port(""), "")
+        check("探测默认不再附加 settle 等待",
+              probe_port.__defaults__[1] == 0.0,
+              "defaults=%r" % (probe_port.__defaults__,))
     except Exception as exc:
         check("调试后端模块可用", False, repr(exc))
 
@@ -1939,6 +2026,14 @@ class App:
         # 四张卡片。usbip 与 at32 是**同一套底座**(usbip 把设备挂成本地 USB,
         # at32 用带 AT32 flash 驱动的 openocd 去烧),所以放相邻并注明依赖关系。
         self._backend_rows = {}
+        # usbip 状态缓存:驱动装没装(进程内缓存一次)、可达性(5s TTL),
+        # 避免每次刷新都在 UI 线程跑 pnputil / DNS 超时把界面卡住。
+        self._usbip_driver_state = None      # Optional[bool]
+        self._usbip_reach_result = None      # Optional[(ok, msg, ts)]
+        self._usbip_attached_state = None    # Optional[bool]
+        self._usbip_attached_ts = 0.0
+        self._usbip_attached_running = False
+        self._usbip_probe_running = False
         for key, title, sub in (
                 ("keil", "Keil µVision", "elaphureLink · 免驱动,走 TCP 直连"),
                 ("openocd", "OpenOCD / VSCode", "openocd-elaphurelink · 免驱动 · 仅 STM32"),
@@ -2006,6 +2101,80 @@ class App:
         self._refresh_backends()
 
     # --- 调试接入页的行为 ---------------------------------------------
+    def _usbip_driver_cached(self, ub) -> bool:
+        """驱动装没装 —— 按进程缓存一次(pnputil 每次 250-300ms)。
+
+        驱动状态在进程生命周期内不会变(用户装完会重启工具),缓存安全。
+        """
+        if self._usbip_driver_state is None:
+            try:
+                self._usbip_driver_state = bool(ub.driver_installed())
+            except Exception:
+                self._usbip_driver_state = False
+        return self._usbip_driver_state
+
+    def _usbip_reach_cached(self):
+        """可达性缓存,5s TTL。返回 (ok, msg) 或 None(需要新探测)。"""
+        c = self._usbip_reach_result
+        if c is not None and (time.monotonic() - c[2]) < 5.0:
+            return (c[0], c[1])
+        return None
+
+    def _usbip_attached_cached(self, ub):
+        """设备是否已挂成本地 USB。返回缓存值;过期时 **后台** 刷新。
+
+        attached() 要起一次 PowerShell 查设备树(实测 1.6-2.0s),
+        绝不能同步放在 UI 线程 —— 那和原来 reachable() 卡 3s 是同一类问题。
+        语义:先返回上一次的值(没有就是 False),同时丢一个后台任务去刷新,
+        结果回来后再 _refresh_backends 一次。
+        """
+        now = time.monotonic()
+        fresh = (self._usbip_attached_state is not None
+                 and now - self._usbip_attached_ts < 3.0)
+        if not fresh and not self._usbip_attached_running:
+            self._usbip_attached_running = True
+
+            def work():
+                try:
+                    state = bool(ub.attached())
+                except Exception:
+                    state = False
+                self.events.put(("usbip_attached", state))
+
+            threading.Thread(target=work, daemon=True,
+                             name="usbip-attached").start()
+        return bool(self._usbip_attached_state)
+
+    def _on_usbip_attached(self, state: bool) -> None:
+        self._usbip_attached_running = False
+        self._usbip_attached_state = bool(state)
+        self._usbip_attached_ts = time.monotonic()
+        self._refresh_backends()
+
+    def _usbip_probe_async(self, ub) -> None:
+        """后台线程探测可达性,结果回主线程刷新。
+
+        reachable() 在 dap.local 解析失败时要 3.0-3.35s(DNS gaierror
+        本身 3.09s),绝不能在 UI 线程同步调用。
+        """
+        if self._usbip_probe_running:
+            return
+        self._usbip_probe_running = True
+
+        def work():
+            try:
+                ok, msg = ub.reachable(timeout=1.5)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            self.events.put(("usbip_probe", (ok, msg)))
+
+        threading.Thread(target=work, daemon=True, name="usbip-probe").start()
+
+    def _on_usbip_probe(self, ok: bool, msg: str) -> None:
+        self._usbip_probe_running = False
+        self._usbip_reach_result = (bool(ok), msg, time.monotonic())
+        self._refresh_backends()
+
     def _backends(self):
         """惰性创建后端管理器 —— 没有第三方工具时不该影响其他功能。"""
         if getattr(self, "_bm", None) is None:
@@ -2063,20 +2232,36 @@ class App:
             row["state"].configure(text="未找到 usbip.exe", fg=self.C_ERR)
             row["btn"].configure(state="disabled", text="挂载")
         else:
-            inst = ub.driver_installed()
+            # driver_installed() 要起 pnputil(~250-300ms),reachable() 在
+            # dap.local 解析失败时要 3.0-3.35s(DNS gaierror 本身 3.09s)。
+            # 这两个都在 UI 线程同步跑会把界面卡死,所以:
+            #   驱动状态按进程缓存一次(装没装不会变),
+            #   可达性 5s TTL 缓存 + 后台线程探测(先显示上一次结果)。
+            inst = self._usbip_driver_cached(ub)
             if not inst:
                 row["state"].configure(
                     text="驱动未装,首次需运行 install_driver.bat", fg=self.C_WARN)
+                row["btn"].configure(text="挂载", state="normal")
             else:
-                # 驱动装了不代表设备连得上 —— 网段不通是最常见的坑,
-                # 这里直接显示可达性,省得用户点了挂载干等超时。
-                ok, msg = ub.reachable(timeout=1.5)
-                if ok:
-                    row["state"].configure(text="驱动已装 · %s" % msg, fg=self.C_OK)
+                # 挂载状态(设备树里有没有 CMSIS-DAP)决定按钮是「挂载」还是
+                # 「卸载」。attached() 要起 PowerShell(~0.5-8s),所以缓存 3s;
+                # 绝不每帧同步查 —— 那和 P1-5 的卡顿是同一类问题。
+                at = self._usbip_attached_cached(ub)
+                if at:
+                    row["btn"].configure(text="卸载", state="normal")
+                else:
+                    row["btn"].configure(text="挂载", state="normal")
+                cached = self._usbip_reach_cached()
+                if cached is None:
+                    row["state"].configure(
+                        text="驱动已装 · 正在探测设备…", fg=self.C_TEXT_DIM)
+                    self._usbip_probe_async(ub)
+                elif cached[0]:
+                    row["state"].configure(text="驱动已装 · %s" % cached[1],
+                                           fg=self.C_OK)
                 else:
                     row["state"].configure(
                         text="驱动已装,但设备不可达(多半是不同网段)", fg=self.C_WARN)
-            row["btn"].configure(text="挂载", state="normal")
 
         # AT32
         row = self._backend_rows["at32"]
@@ -2246,8 +2431,9 @@ class App:
             return
 
         if key == "usbip":
-            # usbip 是「一次动作」:点一次挂载,再点一次卸载
-            if not bm.usbip.driver_installed():
+            # usbip 是「一次动作」:没挂就挂,已挂就卸 —— 按钮文案跟着状态走
+            # (见 _refresh_backends 里的 attached 判断)。
+            if not self._usbip_driver_cached(bm.usbip):
                 ok = self._messagebox.askyesno(
                     "需要先装驱动",
                     "usbip 的 vhci 驱动还没装。\n\n"
@@ -2258,8 +2444,18 @@ class App:
                         "1. 打开目录:%s\n"
                         "2. 右键 install_driver.bat → 以管理员身份运行\n"
                         "3. 装完回来点「挂载」\n\n"
-                        "卸载:uninstall_driver.bat" % bm.usbip.root, "warn")
+                        "卸载驱动:uninstall_driver.bat" % bm.usbip.root, "warn")
                 return
+
+            if bm.usbip.attached():
+                ok, msg = bm.usbip.detach_all()
+                self._log(msg, "ok" if ok else "err")
+                if not ok:
+                    self._show_result(msg, "err")
+                self.root.after(1200, self._refresh_backends)
+                self._usbip_reach_result = None   # 状态变了,缓存作废
+                return
+
             # 挂载前先确认设备真的可达。usbip 自己超时很难懂,而"不同网段"
             # 是最常见的原因 —— 提前拦下来说清楚。
             ok_r, msg_r = bm.usbip.reachable(timeout=2.5)
@@ -2270,6 +2466,8 @@ class App:
             ok, msg = bm.usbip.attach()
             self._log(msg, "ok" if ok else "err")
             self._show_result(msg, "ok" if ok else "warn")
+            # 挂载是异步的(提权后新起进程),等设备树出现再刷新按钮文案
+            self.root.after(2500, self._refresh_backends)
             return
 
     def _poll_openocd_ready(self, tries: int = 0, key: str = "openocd") -> None:
@@ -2376,6 +2574,17 @@ class App:
                     self._append_log(text, tag)
                 elif kind == "disconnect":
                     self._on_serial_disconnect(payload)
+                elif kind == "usbip_probe":
+                    ok, msg = payload
+                    try:
+                        self._on_usbip_probe(ok, msg)
+                    except Exception as exc:
+                        self._log("usbip 探测回调异常: %r" % (exc,), "err")
+                elif kind == "usbip_attached":
+                    try:
+                        self._on_usbip_attached(payload)
+                    except Exception as exc:
+                        self._log("usbip 挂载状态回调异常: %r" % (exc,), "err")
                 elif kind == "job_done":
                     label, result, err, done = payload
                     self._busy = False
@@ -2724,10 +2933,10 @@ class App:
             info = reply.info
             self._show_result(
                 "连接「%s」失败:%s\n\n"
-                "%s\n%s\n\n"
+                "%s\n\n"
                 "下一步:%s\n\n"
                 "技术细节:%d %s"
-                % (net.ssid, info.title, info.detail, "", info.action,
+                % (net.ssid, info.title, info.detail, info.action,
                    reply.code, reply.text), "err")
             self._log("CONNECT %s -> @ERR %d %s" % (net.ssid, reply.code, reply.text), "err")
             return

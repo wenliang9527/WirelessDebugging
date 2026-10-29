@@ -11,7 +11,7 @@
     ├─ tools/
     │  ├─ elaphureLink/            BSD-2(Keil 插件,免驱动)
     │  ├─ openocd-elaphurelink/v0.4.0/   GPL-2(独立进程)
-    │  ├─ usbip-win/v0.3.6-dev/    GPL-2(独立进程)
+    │  ├─ usbip-win/v0.3.6-dev/    GPL-3.0(独立进程)
     │  └─ atopenocd/               GPL-2(雅特力 fork,含 AT32 flash 驱动)
     ├─ firmware/                   自家固件(MIT)+ 烧录说明
     ├─ 快速上手.md
@@ -51,7 +51,9 @@ SOURCES = {
     "usbip-win": (
         "usbip-win 0.3.6-dev",
         "https://github.com/cezanne/usbip-win",
-        "GPL-2.0",
+        # 2026-10-29 修正:GitHub API license.spdx_id = GPL-3.0,不是 2.0。
+        # 此前全项目(含本文档、dap_backends.py、用户手册)误标 GPL-2。
+        "GPL-3.0",
     ),
     "atopenocd": (
         "openocd 0.11.0+dev (Artery AT32 fork)",
@@ -75,29 +77,52 @@ def copytree(src: str, dst: str, skip_pdb: bool = False) -> None:
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*.zip"))
 
 
-def write_tool_notice(tools_dir: str) -> None:
-    """每个第三方目录放一个 源码获取.txt:GPL 义务要求随包告知源码位置。"""
+# 许可证全文内置在本仓库 tools/licenses/ 下,打包时复制到各组件目录。
+# 为什么不从组件源码树里捞:实测四棵树(usbip-win/openocd-elaphurelink/
+# elaphureLink/atopenocd)的发行包里**都没有** COPYING/LICENSE 文件,
+# 原实现找不到就静默跳过 —— 交付包只有"源码获取.txt",没有许可证全文,
+# 与文档承诺的"每个 GPL 目录附 COPYING"不符,对外分发是实质合规缺口。
+LICENSE_DIR = os.path.join(HERE, "licenses")
+LICENSE_BASENAMES = ("COPYING", "COPYING.txt", "LICENSE", "LICENSE.txt")
+
+
+def write_tool_notice(tools_dir: str) -> list:
+    """每个第三方目录放 源码获取.txt + 许可证全文。返回缺失告警列表。
+
+    GPL 义务:分发二进制必须(a)告知源码获取方式,(b)随附许可证全文。
+    缺任何一项都要**显式报错**,不能静默跳过 —— 静默跳过正是上一版的 bug。
+    """
+    warnings = []
     for name, (title, url, lic) in SOURCES.items():
         d = os.path.join(tools_dir, name)
         if not os.path.isdir(d):
+            warnings.append("组件目录不存在,未写声明:%s" % name)
             continue
         with open(os.path.join(d, "源码获取.txt"), "w", encoding="utf-8") as f:
             f.write(
                 "%s\n许可证:%s\n上游源码:%s\n\n"
                 "本组件以独立进程方式被「无线调试器.exe」调用,未与其代码链接。\n"
                 "按许可证要求随包提供获取源码的方式(如上链接)。\n" % (title, lic, url))
-        # GPL-2 全文;BSD-2 放短声明
-        if lic == "GPL-2.0":
-            copying = os.path.join(d, "COPYING")
-            if not os.path.isfile(copying):
-                # 源码树里通常有;没有就从 usbip-win 的复制一份兜底
-                for cand in (os.path.join(tools_dir, "usbip-win", "COPYING"),
-                             os.path.join(SRC_ATOPENOCD, "COPYING"),
-                             os.path.join(SRC_TOOLS_ROOT, "usbip-win",
-                                          "v0.3.6-dev", "COPYING")):
-                    if os.path.isfile(cand):
-                        shutil.copyfile(cand, copying)
-                        break
+
+        # 许可证全文:先看组件目录里有没有,没有就从仓库内置副本复制。
+        has_copying = any(
+            os.path.isfile(os.path.join(d, n)) for n in LICENSE_BASENAMES)
+        if not has_copying:
+            src = None
+            for n in LICENSE_BASENAMES:
+                cand = os.path.join(LICENSE_DIR, "%s.%s" % (lic, n))
+                if os.path.isfile(cand):
+                    src = cand
+                    break
+            # GPL-3.0 允许以 GPL-2.0 的全文兜底?不行,版本不同条款不同。
+            # 这里严格按组件声明的 lic 找;找不到就记告警由 smoke_check 拦。
+            if src:
+                shutil.copyfile(src, os.path.join(d, "COPYING"))
+            else:
+                warnings.append(
+                    "%s 缺 %s 许可证全文(请放到 tools/licenses/%s.COPYING)"
+                    % (name, lic, lic))
+    return warnings
 
 
 LICENSE_SUMMARY = """\
@@ -113,7 +138,7 @@ LICENSE_SUMMARY = """\
   ------------------------  ----------  ----------------------
   elaphureLink              BSD-2      Keil 无线调试插件(免驱动)
   openocd-elaphurelink      GPL-2      OpenOCD(STM32 无线 SWD)
-  usbip-win                 GPL-2      USB over IP 桥接
+  usbip-win                 GPL-3.0    USB over IP 桥接
   atopenocd                 GPL-2      OpenOCD 雅特力 fork(AT32 烧录)
 
 各组件的许可证全文见 tools/<组件>/ 目录(COPYING 或 源码获取.txt)。
@@ -173,8 +198,23 @@ def assemble(pkg_root: str) -> None:
              os.path.join(tools, "elaphureLink"), skip_pdb=True)
     copytree(SRC_ATOPENOCD, os.path.join(tools, "atopenocd"),
              skip_pdb=True)   # 21MB,整树(含 scripts/ 的 349 个 target)
+
+    # usbip-win 的装/卸驱动脚本必须和 v0.3.6-dev/ 同级:
+    # 脚本用 "%~dp0v0.3.6-dev" 相对定位 usbip.exe。界面/文档让用户
+    # 「打开 <usbip.root> → 右键 install_driver.bat」,而
+    # UsbipBackend.root 指的正是 tools/usbip-win/(见 dap_backends.py REL)。
+    # 原实现只复制了 v0.3.6-dev 子目录,交付包里根本没有这两个 bat。
+    src_scripts = os.path.join(HERE, "usbip_scripts")
+    if not os.path.isdir(src_scripts):
+        src_scripts = os.path.join(SRC_TOOLS_ROOT, "usbip-win")  # 开发机回退
+    for bat in ("install_driver.bat", "uninstall_driver.bat"):
+        s = os.path.join(src_scripts, bat)
+        if os.path.isfile(s):
+            shutil.copyfile(s, os.path.join(tools, "usbip-win", bat))
     print("[3/4] 写许可与源码获取说明…")
-    write_tool_notice(tools)
+    warn = write_tool_notice(tools)
+    for w in warn:
+        print("  [警告] %s" % w)
 
     print("[3/4] 固件与文档…")
     fw = os.path.join(pkg_root, "firmware")
@@ -227,10 +267,29 @@ def smoke_check(pkg_root: str) -> None:
     for f in ("快速上手.md", "许可与开源声明.txt", "README.txt"):
         if not os.path.isfile(os.path.join(pkg_root, f)):
             problems.append("缺 " + f)
-    for name in SOURCES:
+    # usbip 装驱动脚本必须在 <pkg>/tools/usbip-win/ 下(与 v0.3.6-dev 同级)。
+    # 界面直接让用户"打开这个目录 → 右键 install_driver.bat",少了它
+    # AT32 烧录的前置步骤直接断掉。
+    for f in ("install_driver.bat", "uninstall_driver.bat"):
+        p = os.path.join(pkg_root, "tools", "usbip-win", f)
+        if not os.path.isfile(p):
+            problems.append("缺 tools/usbip-win/" + f)
+    for name, (_t, _u, lic) in SOURCES.items():
         n = os.path.join(pkg_root, "tools", name, "源码获取.txt")
         if not os.path.isfile(n):
             problems.append("缺 tools/%s/源码获取.txt" % name)
+        # GPL 组件必须带许可证全文;BSD-2 的短声明也一并复制,统一检查
+        if lic.startswith("GPL"):
+            c = os.path.join(pkg_root, "tools", name, "COPYING")
+            if not os.path.isfile(c):
+                problems.append("缺 tools/%s/COPYING(%s 全文)" % (name, lic))
+            else:
+                # 防止拿错版本:GPL-2 全文里有 "Version 2",GPL-3 有 "Version 3"
+                head = open(c, encoding="utf-8", errors="replace").read(2048)
+                want = "Version 3" if lic == "GPL-3.0" else "Version 2"
+                if want not in head:
+                    problems.append(
+                        "tools/%s/COPYING 版本不符(应为 %s)" % (name, lic))
     if problems:
         for p in problems:
             print("  !! " + p)
