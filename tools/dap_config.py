@@ -647,6 +647,20 @@ class DapClient:
         self.info: Optional[DeviceInfo] = None
         # 最近读到的板端日志(用于判断"应用已就绪"),只在内存里保留尾部
         self._seen_log = bytearray()
+        # 上一条命令超时了 = 它的终结帧(@OK/@ERR)还没收到,仍欠着。
+        # 固件是**串行**的:上一条没处理完,不会开始处理下一条。所以欠着的那
+        # 一帧一定先于本条命令的应答出现 —— 收到它时丢掉即可,不需要时间窗口。
+        # 见 _request_once 里"欠账"那段说明。
+        self._stale_owed = 0
+        # 欠账的过期时刻。板子不回话时(探错口 / 板子已经复位),这笔账永远
+        # 收不到;不设过期就会把之后每一条命令的真应答都当成迟到帧吃掉。
+        # 固件最长的阻塞命令是 @CONNECT(25s),所以 30s 足够覆盖任何真迟到。
+        self._stale_expire = 0.0
+        # 这条连接上是否**曾经有命令成功应答过**(即设备被证明是活的)。
+        # 用来消掉一个真实的性能坑:探一个根本不是 DAP 的串口时(蓝牙虚拟口、
+        # CH343 之类),它一个字节都不回,谈不上"有应答还在路上"。
+        # 实测 probe_port 因此从 3.8s 涨到 4.9s。
+        self._ever_ok = False
 
     # --- 生命周期 ----------------------------------------------------
     @property
@@ -807,14 +821,29 @@ class DapClient:
         with self._lock:
             if not self._tr.is_open:
                 return Reply(ok=False, code=408, text="port_closed")
-            # 写命令前先排空未读帧。上一条命令超时(408)时它的应答仍可能
-            # 迟到,留在队列里会被本条命令当成自己的结束帧。
-            # (写之后才到的迟到帧另由下面的 _matches_cmd 拦,见那段说明)
+            # 写命令前先排空未读帧(已经躺在队列里的迟到应答/旧 @DATA)。
+            # **但终结帧不能白排**:它正是用来销账的。实测漏掉这一点会出真
+            # bug:残留帧在"上一条超时返回"和"下一条写出"之间到达(很常见,
+            # 间隙有几百毫秒),被这里一扫而光 -> 欠账永远挂着 -> 下一条命令
+            # 自己的真 @DATA 反被当成残留吃掉 -> 408 且重试两次全废。
+            # 所以边排边数 @OK/@ERR,有几个就销几笔账。
+            drained = 0
+            terminators = 0
             while True:
                 try:
-                    self._frames.get_nowait()
+                    frame = self._frames.get_nowait()
                 except queue.Empty:
                     break
+                drained += 1
+                if frame.partition(" ")[0].upper() in ("@OK", "@ERR"):
+                    terminators += 1
+            if terminators and self._stale_owed:
+                self._stale_owed = max(0, self._stale_owed - terminators)
+            # 欠账过期就销账。过期依据是固件最长阻塞命令(@CONNECT 25s),
+            # 给到 30s 足以覆盖任何真迟到;超期说明那笔账其实永远不会来了
+            # (板子被复位/拔线),继续记着只会把后面的真应答当成迟到帧。
+            if self._stale_owed and time.monotonic() > self._stale_expire:
+                self._stale_owed = 0
             try:
                 self._tr.write((line.rstrip("\r\n") + "\n").encode("utf-8"))
             except Exception as exc:
@@ -825,6 +854,17 @@ class DapClient:
             while True:
                 remain = deadline - time.monotonic()
                 if remain <= 0:
+                    # 记欠账:本条命令的终结帧还没收到,它迟早会到,而那时
+                    # 已经在等下一条命令了 —— 必须记着,下一条收到第一个
+                    # 终结帧时把它当迟到帧丢掉。
+                    #
+                    # 只对"活着的设备"记账:一个字节都没回的口(探错 COM 口、
+                    # 板子没上电)谈不上"应答还在路上",记了只会拖慢探测。
+                    # 实测判据用 _ever_ok(曾成功应答过)时 probe_port 3.83s,
+                    # 与改前一致;用"帧计数>0"会漏记(超时那刻迟到帧还没到)。
+                    if self._ever_ok:
+                        self._stale_owed += 1
+                        self._stale_expire = time.monotonic() + 30.0
                     return Reply(ok=False, code=408, text="TIMEOUT", data=data)
                 try:
                     frame = self._frames.get(timeout=min(remain, 1.0))
@@ -833,12 +873,34 @@ class DapClient:
                 tag, _, body = frame.partition(" ")
                 tag = tag.upper()
                 if tag == "@DATA":
+                    # 欠着账时,上一条的 @DATA 一定还没收完(它全在终结帧之前),
+                    # 所以此时收到的是残留。固件串行 => 本条自己的 @DATA 绝不
+                    # 会出现在上一条的终结帧之前。
+                    if self._stale_owed:
+                        if self.on_log:
+                            try:
+                                self.on_log("丢弃上一条超时命令的残留 @DATA")
+                            except Exception:
+                                pass
+                        continue
                     data.append(body)
                 elif tag in ("@OK", "@ERR"):
-                    # 终结帧必须**长得像这条命令的回复**。上一条超时命令的
-                    # 应答可能在本次命令写出之后才到(实测:板子卡 0.5s 才回
-                    # @STATUS,而用户已经点了扫描),写前排空拦不住它。
-                    # 形态不匹配就当迟到帧丢掉,继续等自己的。
+                    # 第一道:欠账必先还。固件串行 => 上一条超时命令的终结帧
+                    # 一定先于本条的终结帧出现。收到它就把账销掉、丢掉这一帧。
+                    # 这条不需要时间窗口,也不受"迟到多久"影响 —— 之前用固定
+                    # 1.5s 结算窗口的写法,遇到 @CONNECT(板子要 25s)这种
+                    # 长阻塞命令仍会串味,已实测复现后改成计数。
+                    if self._stale_owed:
+                        self._stale_owed -= 1
+                        if self.on_log:
+                            try:
+                                self.on_log("丢弃上一条超时命令的残留 %s:%s"
+                                            % (tag, body.strip()[:50]))
+                            except Exception:
+                                pass
+                        continue
+                    # 第二道:形态判别。挡"没有欠账但确实串了"的情况
+                    # (比如工具刚启动、上一条是上一个进程发的)。
                     if not self._looks_like_reply_to(line, tag, body):
                         if self.on_log:
                             try:
@@ -848,9 +910,12 @@ class DapClient:
                                 pass
                         continue
                     if tag == "@OK":
+                        self._ever_ok = True
                         return Reply(ok=True, code=0, text=body.strip(), data=data)
                     m = RE_ERR.match(body.strip())
                     if m:
+                        # @ERR 也是设备在说话 -> 证明它是活的
+                        self._ever_ok = True
                         return Reply(ok=False, code=int(m.group(1)),
                                      text=m.group(2).strip(), data=data)
                     return Reply(ok=False, code=500, text=body.strip(), data=data)
@@ -1576,6 +1641,254 @@ def run_selftest() -> int:
               c3._looks_like_reply_to("@FOO", "@OK", "whatever"), "")
         c3.close()
 
+        # --- 回归:@DATA 迟到帧不能串(形态判别挡不住)------------------
+        # 上一条 SCAN 超时后,它的 @DATA 会在下一条命令写出之后才到。
+        # @DATA 是数据载体,没有可用形态 —— idx=...&ssid=... 对 SCAN 和 LIST
+        # 长得一样,所以必须在写新命令前把上一条的应答收尾(_await_stale_reply)。
+        #
+        # 夹具说明:不能用 MockTransport —— 它在 write() 里立刻 _handle() 并
+        # 应答,永远构造不出"超时"。这里用最小 Transport,时序全由测试掌控。
+        class _Scripted(Transport):
+            """按第 N 次 write 决定何时吐哪些帧。"""
+
+            name = "SCRIPTED"
+
+            def __init__(self, plan):
+                self._plan = plan
+                self._open = False
+                self._q: List[Tuple[float, str]] = []
+                self._writes = 0
+
+            def open(self):
+                self._open = True
+
+            def close(self):
+                self._open = False
+
+            @property
+            def is_open(self):
+                return self._open
+
+            def write(self, data):
+                self._writes += 1
+                for delay, items in self._plan.get(self._writes, []):
+                    due = time.monotonic() + delay
+                    for it in items:
+                        self._q.append((due, it))
+
+            def read(self, size=4096, timeout=0.05):
+                time.sleep(0.01)
+                now = time.monotonic()
+                ready = [ln for (t0, ln) in self._q if t0 <= now]
+                self._q = [(t0, ln) for (t0, ln) in self._q if t0 > now]
+                if not ready:
+                    return b""
+                return ("\n".join(ready) + "\n").encode("utf-8")
+
+        tr_stale = _Scripted({
+            # 第 1 条:正常 PING。真机上 wait_ready() 一定会先做过这一步,
+            # 它是"设备是活的"的证据 —— 欠账机制的前提(见 _ever_ok 说明)。
+            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            # 第 2 条(@SCAN):应答 0.45s 才到,而 PC 只等 0.25s -> 超时
+            2: [(0.45, ["@DATA idx=0&ssid=STALE_A&rssi=-40&auth=WPA2&ch=1",
+                        "@DATA idx=1&ssid=STALE_B&rssi=-41&auth=WPA2&ch=2",
+                        "@OK scan count=2"])],
+            # 第 3 条(@SCAN):0.45s 才回,晚于迟到帧
+            3: [(0.45, ["@DATA idx=0&ssid=RealNet&rssi=-50&auth=WPA2&ch=6",
+                        "@OK scan count=1"])],
+        })
+        c4 = DapClient(tr_stale)
+        c4.open()
+        c4.ping()                       # 先证明设备活着(等价于 wait_ready)
+        r = c4.request("@SCAN", 0.25, retries=0)
+        check("第一次 SCAN 确实超时了(构造前提)", r.code == 408, "%s" % r.code)
+        nets2 = c4.scan()
+        check("迟到的 @DATA 不会串进下一次 SCAN",
+              not any("STALE" in n.ssid for n in nets2),
+              "%r" % [n.ssid for n in nets2])
+        check("迟到的 @DATA 也不会吞掉真实结果",
+              any(n.ssid == "RealNet" for n in nets2),
+              "%r" % [n.ssid for n in nets2])
+        c4.close()
+
+        # --- 回归:迟到的 @ERR 不能被下一条命令认领 -------------------
+        # @ERR 的码是通用的,任何命令都可能收到,形态判别对 @ERR 直接放行。
+        # 实测:@CONNECT 超时后迟到的 "@ERR 15 HANDSHAKE_TIMEOUT" 被下一条
+        # @STATUS 认领,status() 抛"取状态失败(HANDSHAKE_TIMEOUT)"。
+        tr_err = _Scripted({
+            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            2: [(0.40, ["@ERR 15 HANDSHAKE_TIMEOUT"])],
+            3: [(0.70, ["@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
+        })
+        c5 = DapClient(tr_err)
+        c5.open()
+        c5.ping()                       # 先证明设备活着
+        r = c5.request("@CONNECT ssid=a&pass=b", 0.25, retries=0)
+        check("CONNECT 确实超时了(构造前提)", r.code == 408, "%s" % r.code)
+        try:
+            st = c5.status()
+            check("迟到的 @ERR 不会被下一条命令认领", st.ssid == "Real", repr(st))
+        except Exception as exc:
+            check("迟到的 @ERR 不会被下一条命令认领", False, repr(exc))
+        c5.close()
+
+        # --- 回归:迟到帧晚于"结算窗口"也必须拦住 ---------------------
+        # 上一版用固定的 1.5s 结算窗口(写新命令之前先等上一条的剩余应答)。
+        # 那个窗口挡不住长阻塞命令:@CONNECT 在板子上要轮询 25s,而 PC 侧
+        # 超时后下一个命令可能早就写出去了。实测(2026-10-29)迟到 2.5s 的
+        # "@ERR 15 HANDSHAKE_TIMEOUT" 仍被 status() 认领。
+        #
+        # 现在改成计数欠账:固件串行 => 上一条的终结帧一定先于本条的任何
+        # 输出,收到第一个终结帧就销一笔账,与"迟到多久"无关。
+        tr_late = _Scripted({
+            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            2: [],                       # CONNECT 在 1.5s 内一声不吭 -> 超时
+            3: [(2.50, ["@ERR 15 HANDSHAKE_TIMEOUT",
+                        "@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
+        })
+        c6 = DapClient(tr_late)
+        c6.open()
+        c6.ping()
+        r = c6.request("@CONNECT ssid=a&pass=b", 0.25, retries=0)
+        check("长阻塞命令确实超时(构造前提)", r.code == 408, "%s" % r.code)
+        try:
+            st = c6.status()
+            check("迟到 2.5s 的 @ERR 仍被拦住", st.ssid == "Real", repr(st))
+        except Exception as exc:
+            check("迟到 2.5s 的 @ERR 仍被拦住", False, repr(exc))
+        c6.close()
+
+        # --- 回归:欠账不能永远挂着(否则每条命令都白等/吃错帧)---------
+        # 板子被拔掉/复位时,欠的那笔账永远收不到。必须有作废机制,否则
+        # 之后每条命令的第一帧都会被当成迟到帧吃掉。
+        tr_dead = _Scripted({
+            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            2: [],                       # 超时且永不回
+            3: [(0.02, ["@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
+        })
+        c7 = DapClient(tr_dead)
+        c7.open()
+        c7.ping()
+        c7.request("@STATUS", 0.2, retries=0)      # 超时,记一笔
+        # 模拟"板子被复位、账已过期":直接把过期时刻推到过去
+        c7._stale_expire = 0.0
+        try:
+            st = c7.status()
+            check("欠账过期后不吃掉真应答", st.ssid == "Real", repr(st))
+        except Exception as exc:
+            check("欠账过期后不吃掉真应答", False, repr(exc))
+        c7.close()
+
+        # --- 回归:排空时不能把"销账用的终结帧"一起扔掉 -----------------
+        # 残留帧若在"上一条超时返回"与"下一条写出"之间到达(间隙几百毫秒,
+        # 很常见),它已经躺在队列里,会被写前的排空循环一扫而光 ——
+        # 包括那个本该用来销账的 @OK。结果:欠账永远挂着,下一条命令自己的
+        # 真 @DATA 反被当成残留吃掉 -> 408 且重试全废。
+        # 这是实测发现的,不是推演。
+        tr_drain = _Scripted({
+            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            # 第 2 条 SCAN:PC 0.25s 超时,残留 0.30s 才到
+            2: [(0.30, ["@DATA idx=0&ssid=STALE&rssi=-40&auth=WPA2&ch=1",
+                        "@OK scan count=1"])],
+            3: [(0.10, ["@DATA idx=0&ssid=RealNet&rssi=-50&auth=WPA2&ch=6",
+                        "@OK scan count=1"])],
+        })
+        c8 = DapClient(tr_drain)
+        c8.open()
+        c8.ping()
+        c8.request("@SCAN", 0.25, retries=0)
+        time.sleep(0.40)                   # 残留帧此时已在队列里
+        check("残留帧确实在队列里等着(构造前提)",
+              c8._stale_owed == 1, "owed=%r" % c8._stale_owed)
+        try:
+            nets8 = c8.scan()
+            check("排空残留帧时不能连销账帧一起扔",
+                  [n.ssid for n in nets8] == ["RealNet"],
+                  "%r" % [n.ssid for n in nets8])
+        except Exception as exc:
+            # 别让它炸掉整个 try 块 —— 那会让这条的具体名字消失,只报一句
+            # 笼统的"调试后端模块可用",排查时看不出是哪条挂了。
+            check("排空残留帧时不能连销账帧一起扔", False, repr(exc)[:80])
+        c8.close()
+
+        # --- 回归:关窗后不得再碰已销毁的 Tk 控件 ---------------------
+        # 真实现场:用户在慢任务(@CONNECT 最多 32s / 恢复出厂)期间关窗,
+        # worker 线程稍后仍投递 job_done,而 root 已 destroy —— 回调里一碰
+        # Text/Button 就抛 TclError: invalid command name "..."。
+        # 不修复的表现是:关窗瞬间控制台刷一段红色 Traceback。
+        #
+        # 这里必须**真调用** _drain_events / _on_close,不能读源码判断:
+        # 上一版用 inspect.getsource(),在冻结 exe 里没有源码,直接
+        # "could not get source code" 把整块测试炸掉 —— 而且那种写法
+        # 只证明"代码里出现过 _closing 这三个字",不证明行为对。
+        # 用一个假 self(只带 _closing/_events/root 桩)调真函数。
+        class _FakeRoot:
+            def __init__(self):
+                self.after_called = 0
+
+            def after(self, _ms, _fn=None):
+                self.after_called += 1
+                raise RuntimeError("root 已销毁")   # 模拟 Tk 的 TclError
+
+        class _FakeApp:
+            _drain_events = App._drain_events
+            _on_close = App._on_close
+
+            # POLL_MS 必须带上:_drain_events 末尾要 self.root.after(self.POLL_MS, ...),
+            # 少了它会抛 AttributeError,而那句正好包在 try/except(Exception) 里,
+            # 异常被静默吞掉 —— 表现是 after 根本没被调用,看起来像"功能坏了"。
+            POLL_MS = 60
+
+            def __init__(self, closing):
+                self._closing = closing
+                self.events = queue.Queue()
+                self.events.put(("log", ("x", "sys")))
+                self.root = _FakeRoot()
+
+        # 1) 已关窗:_drain_events 必须立刻返回,不消费事件、不排 after
+        fa = _FakeApp(closing=True)
+        err = None
+        try:
+            fa._drain_events()
+        except Exception as exc:
+            err = exc
+        check("_closing=True 时 _drain_events 不碰控件",
+              err is None and fa.root.after_called == 0,
+              "err=%r after=%d" % (err, fa.root.after_called))
+        check("_closing=True 时事件不消费",
+              fa.events.qsize() == 1, "qsize=%d" % fa.events.qsize())
+
+        # 2) 未关窗:必须真的重排 after(证明上面那条不是因为函数空转才过)
+        # after() 外面包着 try/except(Exception),桩里抛异常会被静默吞掉,
+        # 所以桩**不能抛**,要正常返回并在返回前记账。
+        class _FakeRootOK(_FakeRoot):
+            def after(self, _ms, _fn=None):
+                self.after_called += 1
+                return "after#1"       # 正常返回,模拟成功重排
+
+        fa2 = _FakeApp(closing=False)
+        fa2.root = _FakeRootOK()
+        fa2._append_log = lambda text, tag: None
+        try:
+            fa2._drain_events()
+        except Exception:
+            pass
+        check("_closing=False 时 _drain_events 会重排 after",
+              fa2.root.after_called == 1,
+              "after_called=%d" % fa2.root.after_called)
+
+        # 3) _on_close 必须置位 _closing(否则 1/2 两条都白搭)
+        fa3 = _FakeApp(closing=False)
+        fa3.jobs = queue.Queue()
+        fa3.client = None
+        fa3.server = None
+        try:
+            fa3._on_close()
+        except Exception:
+            pass                       # 关窗后半段会碰不存在的属性,不关心
+        check("_on_close 置位 _closing", fa3._closing is True,
+              "_closing=%r" % fa3._closing)
+
         # --- 回归:usbip 驱动缓存必须可失效 ---------------------------
         # 曾经的坑:驱动状态"进程内只查一次",用户在界面上被提示去装驱动,
         # 装完回来仍是"驱动未装",只能重启工具。
@@ -1728,6 +2041,7 @@ class App:
         self._sort_col = "rssi"
         self._sort_desc = True
         self._busy = False
+        self._closing = False
         self._log_lines = 0
         self._led_timer = None
 
@@ -2793,6 +3107,10 @@ class App:
             self.events.put(("job_done", (label, result, err, done)))
 
     def _drain_events(self) -> None:
+        if getattr(self, "_closing", False):
+            # 窗口正在关/已关:不再消费事件,也不再重排 after。
+            # 队列里剩下的事件属于已销毁的控件,丢弃是对的行为。
+            return
         try:
             while True:
                 kind, payload = self.events.get_nowait()
@@ -2827,7 +3145,12 @@ class App:
         except queue.Empty:
             pass
         finally:
-            self.root.after(self.POLL_MS, self._drain_events)
+            # 关闭过程中 root 可能已经 destroy,after() 会抛 TclError
+            if not getattr(self, "_closing", False):
+                try:
+                    self.root.after(self.POLL_MS, self._drain_events)
+                except Exception:
+                    pass
 
     def _set_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -3626,6 +3949,12 @@ class App:
         return True
 
     def _on_close(self) -> None:
+        # 置关闭标志:此后 _drain_events 不再碰任何控件。
+        # 没有这一步会有真实的红色 Traceback:用户在一个慢任务(@CONNECT 最多
+        # 32s、恢复出厂等)期间关窗,worker 线程稍后仍会投递 job_done,
+        # 而窗口已经 destroy —— 回调里一碰 Text/Button 就抛
+        # TclError: invalid command name "..."
+        self._closing = True
         try:
             self.jobs.put(None)
         except Exception:

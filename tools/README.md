@@ -73,7 +73,7 @@ python dap_config.py --port COM18     指定串口(跳过自动探测)
 python dap_config.py --mock           连假设备,没有板子也能试界面
 python dap_config.py --list           只枚举+探测串口,不开界面
 python dap_config.py --raw "@SCAN"    直接发一条命令看响应
-python dap_config.py --selftest       无硬件自测(135 项)
+python dap_config.py --selftest       无硬件自测(149 项)
 ```
 
 `--mock` 和 `--raw` 可以组合:`python dap_config.py --mock --raw "@SCAN"`。
