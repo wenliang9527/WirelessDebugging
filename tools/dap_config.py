@@ -1060,7 +1060,7 @@ def run_selftest() -> int:
     st = parse_status("mode=STA ssid=MyWiFi ip=192.168.7.125 rssi=-72 ch=11")
     check("STA 状态", st is not None and st.mode == "STA" and st.ip == "192.168.7.125"
           and st.rssi == -72 and st.channel == 11, repr(st))
-    st2 = parse_status("mode=STA ssid=小美的 WiFi ip=192.168.0.9 rssi=-60 ch=6")
+    st2 = parse_status("mode=STA ssid=小美的 WiFi ip=192.168.7.9 rssi=-60 ch=6")
     check("STA 状态含空格 SSID", st2 is not None and st2.ssid == "小美的 WiFi", repr(st2))
     st3 = parse_status("mode=AP ip=192.168.4.1 ssid=DAP-EEFC")
     check("AP 状态", st3 is not None and st3.mode == "AP"
@@ -1077,7 +1077,7 @@ def run_selftest() -> int:
     ck = RE_CONNECT_OK.match("connected ssid=MyWiFi ip=192.168.7.125")
     check("CONNECT 成功帧", ck is not None and ck.group(1) == "MyWiFi"
           and ck.group(2) == "192.168.7.125")
-    ck2 = RE_CONNECT_OK.match("connected ssid=小美的 WiFi ip=192.168.0.9")
+    ck2 = RE_CONNECT_OK.match("connected ssid=小美的 WiFi ip=192.168.7.9")
     check("CONNECT 成功帧含空格", ck2 is not None and ck2.group(1) == "小美的 WiFi", repr(ck2))
 
     em = RE_ERR.match("15 HANDSHAKE_TIMEOUT")
