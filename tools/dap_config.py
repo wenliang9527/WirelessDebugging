@@ -808,12 +808,8 @@ class DapClient:
             if not self._tr.is_open:
                 return Reply(ok=False, code=408, text="port_closed")
             # 写命令前先排空未读帧。上一条命令超时(408)时它的应答仍可能
-            # 迟到,留在队列里会被本条命令当成自己的结束帧:
-            #   @STATUS 超时 → 迟到的 "@OK mode=STA ..." 被 scan() 当成
-            #   SCAN 的结束帧 → 扫描返回 0 个网络;
-            #   @CONNECT 超时 → 迟到的 "connected ssid=... ip=..." 被
-            #   下一条 @STATUS 吃掉 → 报「状态格式不认识」。
-            # 固件侧命令是串行的,写之前队列里的一切都属于过去,丢弃安全。
+            # 迟到,留在队列里会被本条命令当成自己的结束帧。
+            # (写之后才到的迟到帧另由下面的 _matches_cmd 拦,见那段说明)
             while True:
                 try:
                     self._frames.get_nowait()
@@ -838,9 +834,21 @@ class DapClient:
                 tag = tag.upper()
                 if tag == "@DATA":
                     data.append(body)
-                elif tag == "@OK":
-                    return Reply(ok=True, code=0, text=body.strip(), data=data)
-                elif tag == "@ERR":
+                elif tag in ("@OK", "@ERR"):
+                    # 终结帧必须**长得像这条命令的回复**。上一条超时命令的
+                    # 应答可能在本次命令写出之后才到(实测:板子卡 0.5s 才回
+                    # @STATUS,而用户已经点了扫描),写前排空拦不住它。
+                    # 形态不匹配就当迟到帧丢掉,继续等自己的。
+                    if not self._looks_like_reply_to(line, tag, body):
+                        if self.on_log:
+                            try:
+                                self.on_log("丢弃一条疑似迟到的 %s 应答:%s"
+                                            % (tag, body.strip()[:60]))
+                            except Exception:
+                                pass
+                        continue
+                    if tag == "@OK":
+                        return Reply(ok=True, code=0, text=body.strip(), data=data)
                     m = RE_ERR.match(body.strip())
                     if m:
                         return Reply(ok=False, code=int(m.group(1)),
@@ -853,6 +861,55 @@ class DapClient:
                         except Exception:
                             pass
                 # 其他未知 '@' 行直接忽略
+
+    @staticmethod
+    def _cmd_name(line: str) -> str:
+        s = line.strip()
+        if s.startswith("@"):
+            s = s[1:]
+        return s.split(None, 1)[0].upper() if s else ""
+
+    def _looks_like_reply_to(self, line: str, tag: str, body: str) -> bool:
+        """终结帧的形态是否匹配刚发出的那条命令。
+
+        为什么需要:固件命令是串行的,但**超时是 PC 侧的事**。上一条命令
+        超时后它的应答仍可能在路上,而写前排空只能清掉"已经到队列"的那些。
+        真机复现(2026-10-29):
+          @STATUS 超时 0.5s → 用户点扫描 → @SCAN 写出 0.3s 后 STATUS 的
+          "@OK mode=STA ssid=... ip=..." 到了 → 被当成 SCAN 的终结帧 →
+          scan() 返回 0 个网络(真值 1)。
+        加序号要动协议 + 固件同版本发,这里用"回复形态"做低成本的等价判别:
+        每条命令的 @OK 都有固定开头,对不上就不是给我的。
+
+        保守原则:拿不准就返回 True(宁可串味也别把正常应答丢掉)。
+        """
+        b = (body or "").strip()
+        if tag == "@ERR":
+            # 错误码是通用的,任何命令都可能收到;只在明显不可能是回复时丢
+            return True
+        cmd = self._cmd_name(line)
+        # 已知命令的 @OK 首词(取自固件 dap_cmd.c 的 dap_cmd_ok 调用)。
+        # 键是 _cmd_name() 的结果,**不带 @** —— 写成 "@SCAN" 会永远查不到,
+        # 全部走保守分支,等于没做判断(第一版就是这么错的,自测抓到)。
+        expect = {
+            "PING": ("pong",),
+            "STATUS": ("mode=",),
+            "SCAN": ("scan",),
+            "CONNECT": ("connected",),
+            "LIST": ("count=",),
+            "DEL": ("deleted",),
+            "PRIO": ("prioritized",),
+            "PIN": ("pin",),
+            "MODE": ("mode=",),
+            "LED": ("led",),
+            "REBOOT": ("rebooting",),
+            "FACTORY": ("rebooting",),
+        }
+        heads = expect.get(cmd)
+        if not heads:
+            return True          # 未登记的命令:不做判断
+        low = b.lower()
+        return any(low.startswith(h) for h in heads)
 
     # --- 高层命令 ----------------------------------------------------
     def ping(self, timeout: float = 2.0) -> DeviceInfo:
@@ -1470,8 +1527,7 @@ def run_selftest() -> int:
         check("gdb 端口嗅探仍生效", oc.gdb_ready() is True, "")
 
         # --- 回归:超时后的迟到帧不能串到下一条命令 -------------------
-        # 用 MockTransport 直接喂一个"上一条命令的迟到应答",验证
-        # _request_once 写命令前会排空队列。
+        # 场景一:迟到帧在**写命令之前**就已在队列里 -> 靠写前排空。
         mt = MockTransport(connect_delay=0.0)
         c = DapClient(mt)
         c.open()
@@ -1481,6 +1537,44 @@ def run_selftest() -> int:
               info is not None and getattr(info, "fw", None) is not None,
               "got=%r" % (info,))
         c.close()
+
+        # 场景二:迟到帧在**写命令之后**才到 -> 写前排空拦不住。
+        # 真机可复现:板子卡 0.5s 才回 @STATUS,用户已经点了扫描,
+        # STATUS 的 "mode=STA ..." 就成了 SCAN 的终结帧,scan() 返回 0。
+        # 现在靠终结帧形态判别(_looks_like_reply_to)丢掉它。
+        class _LateStatus(MockTransport):
+            def write(self, data):
+                line = data.decode("utf-8", "replace").strip()
+                if line.upper().startswith("@SCAN"):
+                    # SCAN 写出 50ms 后,上一条 STATUS 的迟到应答才到
+                    self._emit("@OK mode=STA ssid=MyWiFi ip=192.168.7.125 "
+                               "rssi=-48 ch=6 prov=0", 0.05)
+                super().write(data)
+
+        mt2 = _LateStatus(connect_delay=0.0)
+        c2 = DapClient(mt2)
+        c2.open()
+        nets = c2.scan()
+        check("写命令之后才到的迟到帧也不串味", len(nets) > 0,
+              "scan() 返回 %d 个网络(应 >0;串味会返回 0)" % len(nets))
+        c2.close()
+
+        # --- 形态判别本身(直接测被测函数,不抄逻辑)-------------------
+        # 第一版把 expect 字典的键写成 "@SCAN",而 _cmd_name() 返回的是
+        # "SCAN",于是永远查不到 -> 全部走保守分支 -> 等于没做判断。
+        m = MockTransport(connect_delay=0.0)
+        c3 = DapClient(m)
+        check("SCAN 不认 STATUS 的回复",
+              not c3._looks_like_reply_to("@SCAN", "@OK", "mode=STA ssid=x"), "")
+        check("SCAN 认自己的回复",
+              c3._looks_like_reply_to("@SCAN", "@OK", "scan count=6"), "")
+        check("STATUS 认自己的回复",
+              c3._looks_like_reply_to("@STATUS", "@OK", "mode=STA ssid=x"), "")
+        check("PING 认自己的回复",
+              c3._looks_like_reply_to("@PING", "@OK", "pong fw=0.7.2"), "")
+        check("未登记命令保守放行",
+              c3._looks_like_reply_to("@FOO", "@OK", "whatever"), "")
+        c3.close()
 
         # --- 回归:usbip 驱动缓存必须可失效 ---------------------------
         # 曾经的坑:驱动状态"进程内只查一次",用户在界面上被提示去装驱动,
