@@ -1,0 +1,28 @@
+# ===== 凭据与隐私(最高优先,永远不许提交)=====
+# 真实 WiFi 密码只存在于固件仓库的 gitignored 文件和本机密码管理器
+wifi_credentials.h
+*credentials*.h
+nvs_dump.bin
+flash_app_readback.bin
+*.flash.bin
+dumps/
+
+# ===== 构建产物 =====
+__pycache__/
+*.pyc
+tools/dist/
+tools/_build/
+
+# ===== 大型二进制(历史遗留的读回/烧录镜像,不含凭据但没必要进 git)=====
+*.bin
+!tools/dist/**
+# 交付包不入 git(86MB,随时可用 build_package.py 重建)
+tools/dist
+
+# ===== 日志与临时 =====
+build_log*.txt
+*.log
+_shot*.png
+
+# ===== 会话/工具私有 =====
+.zcode/
