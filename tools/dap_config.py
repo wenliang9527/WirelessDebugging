@@ -153,8 +153,10 @@ RE_SCAN_DATA = re.compile(r"^idx=(\d+)&ssid=(.*)&rssi=(-?\d+)&auth=([^&]*)&ch=(\
 RE_LIST_DATA = re.compile(r"^idx=(\d+)&ssid=(.*)&pass=(.*?)&pin=(\d)\s*$", re.S)
 RE_LIST_DATA_OLD = re.compile(r"^idx=(\d+)&ssid=(.*)&pass=(.*?)\s*$", re.S)
 RE_CONNECT_OK = re.compile(r"^connected\s+ssid=(.*?)\s+ip=(" + _IP + r")\s*$", re.S)
+# prov= 是 v0.8+ 固件新增的未配网标志;老固件没有该字段,可选组兼容两者。
 RE_STATUS_STA = re.compile(
-    r"^mode=STA\s+ssid=(.*?)\s+ip=(" + _IP + r")\s+rssi=(-?\d+)\s+ch=(\d+)\s*$", re.S)
+    r"^mode=STA\s+ssid=(.*?)\s+ip=(" + _IP + r")\s+rssi=(-?\d+)\s+ch=(\d+)"
+    r"(?:\s+prov=(\d))?\s*$", re.S)
 RE_STATUS_AP = re.compile(r"^mode=AP\s+ip=(" + _IP + r")\s+ssid=(.*?)\s*$", re.S)
 RE_PING = re.compile(r"^pong\s+fw=(\S+)\s+mac=(\S+)\s+mode=(\S+)\s*$")
 RE_ERR = re.compile(r"^(\d+)\s*(.*)$", re.S)
@@ -189,6 +191,7 @@ class Status:
     ssid: str = ""
     rssi: int = 0
     channel: int = 0
+    prov: bool = False   # True = 未配网(一条已保存网络都没有,v0.8+ 固件上报)
 
 
 @dataclass
@@ -227,7 +230,8 @@ def parse_status(body: str) -> Optional[Status]:
     m = RE_STATUS_STA.match(body)
     if m:
         return Status(mode="STA", ssid=m.group(1), ip=m.group(2),
-                      rssi=int(m.group(3)), channel=int(m.group(4)))
+                      rssi=int(m.group(3)), channel=int(m.group(4)),
+                      prov=bool(m.group(5) == "1"))
     return None
 
 
@@ -1019,6 +1023,10 @@ def run_selftest() -> int:
     st3 = parse_status("mode=AP ip=192.168.4.1 ssid=DAP-EEFC")
     check("AP 状态", st3 is not None and st3.mode == "AP"
           and st3.ip == "192.168.4.1" and st3.ssid == "DAP-EEFC", repr(st3))
+    st4 = parse_status("mode=STA ssid=(none) ip=0.0.0.0 rssi=0 ch=0 prov=1")
+    check("STA 未配网态 prov=1", st4 is not None and st4.prov is True, repr(st4))
+    st5 = parse_status("mode=STA ssid=MyWiFi ip=192.168.7.125 rssi=-50 ch=6 prov=0")
+    check("STA prov=0 非未配网", st5 is not None and st5.prov is False, repr(st5))
 
     p = parse_ping("pong fw=0.7.0 mac=AA:BB:CC:DD:EE:FC mode=STA")
     check("PING 帧", p is not None and p.fw == "0.7.0"
@@ -1849,11 +1857,12 @@ class App:
         # 键盘流:选中行按 Delete 直接走删除确认,和资源管理器一致
         self.save_tree.bind("<Delete>", lambda e: self._do_delete())
 
-        note = ("列表按优先级从上到下排列 —— 设备开机后照这个顺序逐个尝试。\n"
-                "「固定优先」= 开机永远先试这一条,不会被下次「连接」的自动置顶顶掉"
-                "(适合公司/家里的主网络);\n"
-                "「置顶」只是把条目挪到最前,连过别的网络后会被顶下去。\n"
-                "「恢复出厂设置」会清空这里,回到固件里写死的出厂网络。")
+        note = ("主网模型:设备开机只连「主网」一条 —— 即 pin 过的最靠前条目,"
+                "没 pin 就是最近连的那条;连不上只重试它,不会自动换网。\n"
+                "「固定优先」= 把这条钉成主网(📌),连过别的网络也不会被顶掉;\n"
+                "「连接」新网络成功后,那条会成为最近使用的(未 pin 时即主网)。\n"
+                "「恢复出厂设置」清空全部已存网络并回到未配网状态,"
+                "需要重新插 USB 配网。")
         tk.Label(tab2, text=note, bg=self.C_CARD, fg=self.C_TEXT_DIM,
                  font=(ui, 9), justify="left",
                  anchor="w").pack(fill="x", padx=14, pady=(10, 14))
@@ -2577,8 +2586,11 @@ class App:
             self.top_status.set("STA 已连接  ·  %s  ·  %s  ·  %d dBm"
                                 % (st.ssid, st.ip, st.rssi))
             self.status_label.configure(bg=self.C_OK_BG, fg=self.C_OK)
+        elif st.prov:
+            self.top_status.set("未配网  ·  还没有保存任何 WiFi  ·  等待扫描并连接")
+            self.status_label.configure(bg=self.C_WARN_BG, fg=self.C_WARN)
         else:
-            self.top_status.set("STA 未连接  ·  正在按已保存列表重试  ·  当前目标 %s"
+            self.top_status.set("STA 未连接  ·  正在重试主网 %s(不会自动换网)"
                                 % (st.ssid or "—"))
             self.status_label.configure(bg=self.C_WARN_BG, fg=self.C_WARN)
 
@@ -2758,12 +2770,19 @@ class App:
             self.res_hint.configure(text="下面这段可直接复制")
 
     def _sta_summary(self, st: Status) -> str:
+        if st.prov:
+            return ("当前:还没有配置任何 WiFi(出厂/恢复出厂后的状态)。\n\n"
+                    "在列表里选一个网络、填密码、点「连接选中」—— 连上的这条\n"
+                    "就是板子的主网,以后开机只试它一条,连不上也不会自动换网。\n"
+                    "要换主网:重新连接别的网络,或在「已保存网络」里对某条点「固定优先」。")
         if st.ip and st.ip != "0.0.0.0":
-            return ("当前:已连「%s」,地址 %s,信号 %d dBm。\n\n"
-                    "想换网络就点「扫描 WiFi」选一个新的;想改模式用上面的按钮。"
+            return ("当前:已连「%s」,地址 %s,信号 %d dBm(这是主网)。\n\n"
+                    "板子开机只试这一条,连不上就按退避间隔重试,不会自动换别的网。\n"
+                    "想换主网:点「扫描 WiFi」连一个新的;或者拔了路由器它就一直重试这一条。"
                     % (st.ssid, st.ip, st.rssi))
-        return ("当前:STA 模式但还没连上,板子正在按「已保存网络」里的顺序自动重试。\n\n"
-                "点「扫描 WiFi」找一个能用的网络手动连。" if st.mode == "STA" else "")
+        return ("当前:STA 模式但主网连不上,板子正在按 1/2/5/10/15/30 秒的间隔重试同一条,"
+                "不会自动换网。\n\n"
+                "检查路由器;或者点「扫描 WiFi」手动换一个网络。" if st.mode == "STA" else "")
 
     def _show_ap_hint(self, st: Status) -> None:
         self._show_result(
@@ -3042,7 +3061,8 @@ class App:
         ok = self._messagebox.askyesno(
             "确认恢复出厂",
             "会清空板子里保存的所有 WiFi 凭据,并重启板子。\n\n"
-            "之后板子只能用固件里写死的出厂网络。确定吗?")
+            "之后板子回到「未配网」状态:不连任何 WiFi,红色灯快闪,\n"
+            "必须重新插 USB 用本工具配网。确定吗?")
         if not ok:
             return
         self._show_result("正在恢复出厂并重启,等板子回来后自动重连…", "info")
