@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import queue
 import re
 import sys
@@ -46,9 +48,128 @@ TIMEOUT_DEFAULT = 5.0
 TIMEOUT_SCAN = 15.0
 TIMEOUT_CONNECT = 32.0
 
-# 固件固定的 AP 热点密码(main/wifi_handle.c: AP_PASSWORD)
-AP_DEFAULT_PASSWORD = "12345678"
+# AP 模式下板子的固定地址(热点网关)
 AP_DEFAULT_IP = "192.168.4.1"
+
+# 注意:这里**不再有** AP_DEFAULT_PASSWORD。
+# v0.8.0 起 AP 密码由板子首启随机生成、存 NVS,经 @AP 命令读回。
+# 曾经这里写着 "12345678" 并在 AP 面板里明文显示 —— 那个串是公开常量,
+# 等于热点没有密码。谁要把写死的密码加回来,先想想这条线。
+
+# ====================================================================== #
+# 用户设置持久化(%APPDATA%\无线调试器\settings.json)
+# ====================================================================== #
+#
+# 存什么:只有三个**界面偏好**,不带任何凭据。
+#   addr          设备地址(mDNS 名或 IP)
+#   target        OpenOCD 的 target(如 stm32f1x)
+#   at32_target   atopenocd 的 target(如 at32f403axG)
+#
+# 刻意不存的东西:
+#   · 串口号 —— 每次插拔都可能变(COM18 → COM22),存了只会连错板子
+#   · WiFi 密码 —— 那是板子上的配置,PC 侧不落盘
+#   · 端口/波特率 —— 常量,没必要
+#
+# 为什么不放在 exe 旁边:Program Files 下不可写,而且交付包可能被解压到
+# 只读介质。%APPDATA% 是 Windows 上放用户设置的标准位置。
+SETTINGS_VERSION = 1
+SETTINGS_KEYS = ("addr", "target", "at32_target")
+# 出厂默认值。GUI 用它做两件事:① 首次启动的初值 ② 判断"是不是已经全是默认,
+# 是就把设置文件删掉"(见 App._persist_settings)。
+DEFAULT_SETTINGS = {
+    "addr": "dap.local",
+    "target": "stm32f1x",
+    "at32_target": "at32f403axG",
+}
+
+
+def delete_settings_file() -> Tuple[bool, str]:
+    """删掉 settings.json。文件本来就不存在也算成功。
+
+    做成模块级函数而不是 App 的方法:自测要用假 self 调真逻辑,
+    方法绑到子类上会多一个 self 参数(踩过:TypeError takes 0 positional
+    arguments but 1 was given)。纯粹的"删文件"本就不需要任何界面状态。
+    """
+    try:
+        p = settings_path()
+        if os.path.exists(p):
+            os.remove(p)
+        return True, p
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _settings_dir() -> str:
+    """设置目录。Windows 用 %APPDATA%,其他平台用 XDG 惯例。
+
+    函数内现算而不是模块级常量 —— 前者在测试里可以 monkeypatch 环境,
+    后者会被 import 时就焊死。
+    """
+    base = os.environ.get("APPDATA")
+    if not base:
+        base = os.environ.get("XDG_CONFIG_HOME")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "无线调试器")
+
+
+def settings_path() -> str:
+    """settings.json 的完整路径(不保证存在)。"""
+    return os.path.join(_settings_dir(), "settings.json")
+
+
+def load_settings() -> Dict[str, str]:
+    """读用户设置。文件缺失/损坏/版本不符都返回 {} —— 绝不抛异常。
+
+    为什么容忍损坏:设置文件是"锦上添花",不该因为一个手抖编辑过的
+    JSON 就让整个工具起不来。宁可回到默认值,也不能白屏。
+    """
+    p = settings_path()
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("version") != SETTINGS_VERSION:
+        # 版本不符:当作没有设置,但**不删**用户文件 —— 万一将来要迁移
+        return {}
+    out = {}
+    for k in SETTINGS_KEYS:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    return out
+
+
+def save_settings(values: Dict[str, str]) -> Tuple[bool, str]:
+    """写用户设置。返回 (ok, message)。失败不抛异常。
+
+    先写临时文件再 os.replace —— 直接覆盖时如果进程被杀,会留下半个 JSON,
+    下次启动就读不出设置。os.replace 在同一分区上是原子的。
+    """
+    d = _settings_dir()
+    p = settings_path()
+    payload = {"version": SETTINGS_VERSION}
+    for k in SETTINGS_KEYS:
+        v = values.get(k)
+        if isinstance(v, str) and v.strip():
+            payload[k] = v.strip()
+    tmp = p + ".tmp"
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+        return True, p
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, str(exc)
 
 # 调试服务端口
 PORT_USBIP = 3240
@@ -91,7 +212,7 @@ ERR_INFO: Dict[int, ErrInfo] = {
     400: ErrInfo("命令参数不对", "工具发的命令固件没看懂。", "多半是工具版本与固件不匹配,请更新工具或固件。"),
     404: ErrInfo("固件不支持这条命令",
                  "板子上的固件还是配网功能之前的老版本。",
-                 "烧写 v0.7.2 或更新的固件(见 03_firmware/固件烧录指南.md)。"),
+                 "烧写 v0.8.0 或更新的固件(见 03_firmware/固件烧录指南.md)。"),
     # 405 一码两义(固件 dap_cmd.c):wifi_still_starting / no_saved_networks。
     # 两者下一步动作完全相反 —— 一个"等一会儿",一个"先去配一条网络"。
     # 静态表只能给通用解释,精确分流见 explain_reply()。
@@ -198,6 +319,10 @@ RE_PING = re.compile(r"^pong\s+fw=(\S+)\s+mac=(\S+)\s+mode=(\S+)\s*$")
 RE_ERR = re.compile(r"^(\d+)\s*(.*)$", re.S)
 RE_SCAN_OK = re.compile(r"^scan\s+count=(\d+)")
 RE_LIST_OK = re.compile(r"^count=(\d+)\s+source=(\S+)")
+# @AP 的应答(v0.8+):"ap ssid=DAP-XXXX pass=XXXXXXXXXX [note=...]"
+# 老固件没有这条命令(会回 404),调用方要能区分"没有这个功能"和"格式不认识"。
+RE_AP_OK = re.compile(
+    r"^ap\s+ssid=(.*?)\s+pass=(\S+)(?:\s+note=(\S+))?\s*$", re.S)
 
 
 @dataclass
@@ -276,6 +401,22 @@ def parse_ping(body: str) -> Optional[DeviceInfo]:
     if not m:
         return None
     return DeviceInfo(fw=m.group(1), mac=m.group(2), mode=m.group(3))
+
+
+@dataclass
+class ApInfo:
+    """@AP 的应答。note 非空表示"密码已换、下次切模式生效"。"""
+    ssid: str
+    password: str
+    note: str = ""
+
+
+def parse_ap(body: str) -> Optional[ApInfo]:
+    m = RE_AP_OK.match(body)
+    if not m:
+        return None
+    return ApInfo(ssid=m.group(1), password=m.group(2),
+                  note=(m.group(3) or ""))
 
 
 def version_tuple(v: str) -> Tuple[int, ...]:
@@ -430,6 +571,8 @@ class MockTransport(Transport):
         self._lock = threading.Lock()
         self._connect_delay = connect_delay
         self._led_pct = 4
+        # 模拟 v0.8+ 的随机 AP 密码(真机是首启生成的 10 位)
+        self._ap_pass = "K7M4RTW9XY"
 
     def open(self) -> None:
         self._open = True
@@ -477,7 +620,7 @@ class MockTransport(Transport):
         self._emit("I (1234) mock: got @%s" % cmd, 0.0)
 
         if cmd == "PING":
-            self._emit("@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
+            self._emit("@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
         elif cmd == "STATUS":
             if self._mode == "AP":
                 self._emit("@OK mode=AP ip=%s ssid=DAP-EEFC" % AP_DEFAULT_IP, 0.02)
@@ -578,6 +721,17 @@ class MockTransport(Transport):
                 else:
                     self._led_pct = pct
                     self._emit("@OK led pct=%d saved" % pct, 0.05)
+        elif cmd == "AP":
+            sub = args.strip().upper()
+            if not sub:
+                self._emit("@OK ap ssid=DAP-EEFC pass=%s" % self._ap_pass, 0.02)
+            elif sub == "REGEN":
+                # 换一个和旧的不同的假密码,便于界面测试
+                self._ap_pass = "P3QW8NJKTV"
+                self._emit("@OK ap ssid=DAP-EEFC pass=%s "
+                           "note=applies_on_next_mode_switch" % self._ap_pass, 0.05)
+            else:
+                self._emit("@ERR 400 usage: @AP or @AP REGEN", 0.02)
         elif cmd == "FACTORY":
             self._saved = [[s, p, 0] for (s, p) in MOCK_FACTORY_NETS]
             self._source = "factory"
@@ -1050,6 +1204,28 @@ class DapClient:
     def led_set(self, pct: int) -> Reply:
         return self.request("@LED %d" % int(pct), 6.0)
 
+    def ap_get(self) -> Optional[ApInfo]:
+        """读 AP 热点 SSID 与密码(v0.8+)。
+
+        老固件没有 @AP,会回 404 —— 此时返回 None,让界面走"读不到"分支,
+        而不是把 404 当成错误弹窗(对老固件来说是正常现象)。
+        """
+        r = self.request("@AP", 4.0)
+        if not r.ok:
+            return None
+        return parse_ap(r.text)
+
+    def ap_regen(self) -> Optional[ApInfo]:
+        """重新生成 AP 密码。返回新密码,失败返回 None。
+
+        注意:新密码要等下一次切模式/重启才真正生效 —— 固件在应答的
+        note= 字段里写明这一点,界面必须如实转述,不能让用户以为立刻生效。
+        """
+        r = self.request("@AP REGEN", 8.0)
+        if not r.ok:
+            return None
+        return parse_ap(r.text)
+
     def factory_reset(self) -> Reply:
         r = self.request("@FACTORY", 5.0)
         return r
@@ -1228,8 +1404,8 @@ def run_selftest() -> int:
     st5 = parse_status("mode=STA ssid=MyWiFi ip=192.168.7.125 rssi=-50 ch=6 prov=0")
     check("STA prov=0 非未配网", st5 is not None and st5.prov is False, repr(st5))
 
-    p = parse_ping("pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA")
-    check("PING 帧", p is not None and p.fw == "0.7.2"
+    p = parse_ping("pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA")
+    check("PING 帧", p is not None and p.fw == "0.8.0"
           and p.mac == "AA:BB:CC:DD:EE:FC" and p.mode == "STA", repr(p))
 
     ck = RE_CONNECT_OK.match("connected ssid=MyWiFi ip=192.168.7.125")
@@ -1287,7 +1463,7 @@ def run_selftest() -> int:
     client.open()
     try:
         info = client.ping()
-        expect_eq("PING fw", info.fw, "0.7.2")
+        expect_eq("PING fw", info.fw, "0.8.0")
         st = client.status()
         check("初始 STA", st.mode == "STA", repr(st))
 
@@ -1402,6 +1578,32 @@ def run_selftest() -> int:
         rows3, source3 = client.list_saved()
         expect_eq("出厂后条数", len(rows3), len(MOCK_FACTORY_NETS))
         expect_eq("出厂后来源", source3, "factory")
+
+        # --- @AP:随机 AP 密码(v0.8+)-----------------------
+        ap = client.ap_get()
+        check("AP 信息能读到", ap is not None and ap.ssid.startswith("DAP-"),
+              repr(ap))
+        check("AP 密码不是公开常量 12345678",
+              ap is not None and ap.password != "12345678",
+              repr(ap.password if ap else None))
+        check("AP 密码长度 10", ap is not None and len(ap.password) == 10,
+              repr(ap.password if ap else None))
+        old_pass = ap.password if ap else None
+
+        ap2 = client.ap_regen()
+        check("REGEN 返回新密码", ap2 is not None and ap2.password != old_pass,
+              "%r -> %r" % (old_pass, ap2.password if ap2 else None))
+        check("REGEN 带 note 说明",
+              ap2 is not None and "applies_on_next" in ap2.note, repr(ap2))
+        # 生成后 get 必须返回新值(证明写进了板子,而不是只回一次)
+        ap3 = client.ap_get()
+        check("REGEN 后 get 返回新密码",
+              ap3 is not None and ap3.password == (ap2.password if ap2 else ""),
+              repr(ap3))
+
+        r = client.request("@AP BOGUS", 2.0)
+        check("@AP 未知子命令 -> 400", (not r.ok) and r.code == 400,
+              "%s %s" % (r.code, r.text))
 
         r = client.request("@NOSUCHCMD", 2.0)
         check("未知命令 -> 404", (not r.ok) and r.code == 404, "%s %s" % (r.code, r.text))
@@ -1636,7 +1838,7 @@ def run_selftest() -> int:
         check("STATUS 认自己的回复",
               c3._looks_like_reply_to("@STATUS", "@OK", "mode=STA ssid=x"), "")
         check("PING 认自己的回复",
-              c3._looks_like_reply_to("@PING", "@OK", "pong fw=0.7.2"), "")
+              c3._looks_like_reply_to("@PING", "@OK", "pong fw=0.8.0"), "")
         check("未登记命令保守放行",
               c3._looks_like_reply_to("@FOO", "@OK", "whatever"), "")
         c3.close()
@@ -1688,7 +1890,7 @@ def run_selftest() -> int:
         tr_stale = _Scripted({
             # 第 1 条:正常 PING。真机上 wait_ready() 一定会先做过这一步,
             # 它是"设备是活的"的证据 —— 欠账机制的前提(见 _ever_ok 说明)。
-            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            1: [(0.02, ["@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
             # 第 2 条(@SCAN):应答 0.45s 才到,而 PC 只等 0.25s -> 超时
             2: [(0.45, ["@DATA idx=0&ssid=STALE_A&rssi=-40&auth=WPA2&ch=1",
                         "@DATA idx=1&ssid=STALE_B&rssi=-41&auth=WPA2&ch=2",
@@ -1716,7 +1918,7 @@ def run_selftest() -> int:
         # 实测:@CONNECT 超时后迟到的 "@ERR 15 HANDSHAKE_TIMEOUT" 被下一条
         # @STATUS 认领,status() 抛"取状态失败(HANDSHAKE_TIMEOUT)"。
         tr_err = _Scripted({
-            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            1: [(0.02, ["@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
             2: [(0.40, ["@ERR 15 HANDSHAKE_TIMEOUT"])],
             3: [(0.70, ["@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
         })
@@ -1741,7 +1943,7 @@ def run_selftest() -> int:
         # 现在改成计数欠账:固件串行 => 上一条的终结帧一定先于本条的任何
         # 输出,收到第一个终结帧就销一笔账,与"迟到多久"无关。
         tr_late = _Scripted({
-            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            1: [(0.02, ["@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
             2: [],                       # CONNECT 在 1.5s 内一声不吭 -> 超时
             3: [(2.50, ["@ERR 15 HANDSHAKE_TIMEOUT",
                         "@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
@@ -1762,7 +1964,7 @@ def run_selftest() -> int:
         # 板子被拔掉/复位时,欠的那笔账永远收不到。必须有作废机制,否则
         # 之后每条命令的第一帧都会被当成迟到帧吃掉。
         tr_dead = _Scripted({
-            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            1: [(0.02, ["@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
             2: [],                       # 超时且永不回
             3: [(0.02, ["@OK mode=STA ssid=Real ip=10.0.0.5 rssi=-50 ch=6 prov=0"])],
         })
@@ -1786,7 +1988,7 @@ def run_selftest() -> int:
         # 真 @DATA 反被当成残留吃掉 -> 408 且重试全废。
         # 这是实测发现的,不是推演。
         tr_drain = _Scripted({
-            1: [(0.02, ["@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
+            1: [(0.02, ["@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=STA"])],
             # 第 2 条 SCAN:PC 0.25s 超时,残留 0.30s 才到
             2: [(0.30, ["@DATA idx=0&ssid=STALE&rssi=-40&auth=WPA2&ch=1",
                         "@OK scan count=1"])],
@@ -1888,6 +2090,122 @@ def run_selftest() -> int:
             pass                       # 关窗后半段会碰不存在的属性,不关心
         check("_on_close 置位 _closing", fa3._closing is True,
               "_closing=%r" % fa3._closing)
+
+        # --- 用户设置持久化(设备地址 / target)-----------------------
+        # 通过临时目录测,绝不碰用户真实的 %APPDATA%。
+        # 这里直接调用 load_settings/save_settings —— 它们是模块级函数,
+        # 测的是真实代码路径,不是复制一份逻辑。
+        import tempfile as _tf
+        import shutil as _sh
+        _old_appdata = os.environ.get("APPDATA")
+        _tmpdir = _tf.mkdtemp(prefix="dapcfg_")
+        try:
+            os.environ["APPDATA"] = _tmpdir
+            check("设置路径在 %APPDATA% 下",
+                  "无线调试器" in settings_path()
+                  and os.path.dirname(settings_path()).startswith(_tmpdir),
+                  settings_path())
+
+            # 空环境:读出来必须是空 dict(不能抛)
+            expect_eq("没有设置文件时返回空", load_settings(), {})
+
+            ok, _p = save_settings({"addr": "192.168.7.125",
+                                    "target": "stm32f4x",
+                                    "at32_target": "at32f403axG"})
+            check("保存设置成功", ok, _p)
+            got = load_settings()
+            expect_eq("地址读回", got.get("addr"), "192.168.7.125")
+            expect_eq("target 读回", got.get("target"), "stm32f4x")
+            expect_eq("at32 target 读回", got.get("at32_target"),
+                      "at32f403axG")
+
+            # 直接看**文件内容**,而不是只走 load_settings ——
+            # 上一版只测了 load 的过滤,把 save 的白名单去掉(让它把所有
+            # 传入键都写进磁盘)测试照样全绿。那等于"写进去脏东西但读不
+            # 回来",虽然当前无害,但文件会被污染,而且将来若有别的读取方
+            # (备份、诊断)就露出来了。
+            import json as _json
+            save_settings({"addr": "a", "evil": "should_not_survive"})
+            with open(settings_path(), encoding="utf-8") as f:
+                on_disk = _json.load(f)
+            check("save 只写白名单键",
+                  "evil" not in on_disk
+                  and set(on_disk) <= set(SETTINGS_KEYS) | {"version"},
+                  repr(sorted(on_disk)))
+
+            # 读路径也要挡:手改文件塞进来的键不许出现
+            with open(settings_path(), encoding="utf-8") as f:
+                raw = _json.load(f)
+            raw["evil"] = "should_not_survive"
+            raw["version"] = SETTINGS_VERSION
+            with open(settings_path(), "w", encoding="utf-8") as f:
+                _json.dump(raw, f)
+            expect_eq("白名单外的键被忽略", "evil" in load_settings(), False)
+
+            # 损坏的 JSON:必须静默回落,不能抛
+            with open(settings_path(), "w", encoding="utf-8") as f:
+                f.write("{ this is not json")
+            expect_eq("损坏文件返回空", load_settings(), {})
+
+            # 版本不符:当作没有设置,但**不能删用户文件**
+            with open(settings_path(), "w", encoding="utf-8") as f:
+                _json.dump({"version": 999, "addr": "x"}, f)
+            expect_eq("版本不符返回空", load_settings(), {})
+            check("版本不符不删文件", os.path.exists(settings_path()), "")
+
+            # 空字符串不该被保存(否则会把用户填的空当成有效设置)
+            save_settings({"addr": "", "target": "  "})
+            got2 = load_settings()
+            check("空值不写入", not got2.get("addr") and not got2.get("target"),
+                  repr(got2))
+
+            # "全是默认值"必须删文件,而不是写一份和默认一样的 JSON。
+            # 实测踩过:恢复默认删掉文件后,_apply_addr 里那句 _persist 会
+            # 立刻把它写回来,用户看到文件还在,以为没重置成功。
+            class _A:
+                _persist_settings = App._persist_settings
+
+                class V:
+                    def __init__(self, v):
+                        self.v = v
+
+                    def get(self):
+                        return self.v
+
+                def __init__(self, addr, tgt, at32):
+                    self._settings = {}
+                    self._settings_saved = {"addr": "x"}   # 强制"有变化"
+                    self.logs = []
+                    self.addr_var = self.V(addr)
+                    self.target_var = self.V(tgt)
+                    self.at32_var = self.V(at32)
+
+                def _log(self, msg, kind="sys"):
+                    self.logs.append(msg)
+
+            save_settings({"addr": "192.168.7.9"})   # 先造一个文件出来
+            check("构造前提:设置文件已存在",
+                  os.path.exists(settings_path()), settings_path())
+            a = _A(DEFAULT_SETTINGS["addr"], DEFAULT_SETTINGS["target"],
+                   DEFAULT_SETTINGS["at32_target"])
+            a._persist_settings()
+            check("全是默认值时删掉设置文件",
+                  not os.path.exists(settings_path()), settings_path())
+            check("删文件时记了日志", any("默认" in m for m in a.logs),
+                  repr(a.logs))
+
+            # 非默认值要写盘 —— 反证上面那条不是"永远删"
+            b = _A("192.168.7.77", DEFAULT_SETTINGS["target"],
+                   DEFAULT_SETTINGS["at32_target"])
+            b._persist_settings()
+            expect_eq("非默认值会写盘", load_settings().get("addr"),
+                      "192.168.7.77")
+        finally:
+            if _old_appdata is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = _old_appdata
+            _sh.rmtree(_tmpdir, ignore_errors=True)
 
         # --- 回归:usbip 驱动缓存必须可失效 ---------------------------
         # 曾经的坑:驱动状态"进程内只查一次",用户在界面上被提示去装驱动,
@@ -2044,6 +2362,11 @@ class App:
         self._closing = False
         self._log_lines = 0
         self._led_timer = None
+        # 用户界面偏好(设备地址 / 两个 target)。文件缺失或损坏时是空 dict,
+        # 界面各处用 .get(key, 默认值) 兜底 —— 见 load_settings() 的说明。
+        self._settings = load_settings()
+        # 已经写进磁盘的那份,用于"只在真的变了才写"
+        self._settings_saved = dict(self._settings)
 
         self.root = tk.Tk()
         self.root.title("无线调试器 · 配网工具")
@@ -2286,6 +2609,12 @@ class App:
         self.mode_btn_ap.pack(side="left")
         ttk.Button(row3, text="重启设备", width=9,
                    command=self._reboot).pack(side="left", padx=(14, 0))
+        # AP 密码是随机生成的、存在板子里 —— 用户必须有个地方能看到它,
+        # 否则"连不上自家热点"就没救了。也提供重新生成(带确认)。
+        ttk.Button(row3, text="AP 密码", width=9,
+                   command=self._show_ap_password).pack(side="left", padx=(6, 0))
+        ttk.Button(row3, text="重新生成", width=9,
+                   command=self._regen_ap_password).pack(side="left", padx=(2, 0))
 
         # 状态灯亮度:灯太刺眼是常见抱怨,给个滑块当场调,不用重烧固件
         self.fw_var = tk.StringVar(value="—")
@@ -2509,13 +2838,18 @@ class App:
         bar.pack(fill="x", padx=14, pady=(14, 8))
         tk.Label(bar, text="设备地址", bg=self.C_CARD, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
-        self.addr_var = tk.StringVar(value="dap.local")
+        # 启动时的默认值来自 settings.json(用户上次填的),没有才用 dap.local
+        self.addr_var = tk.StringVar(
+            value=self._settings.get("addr", DEFAULT_SETTINGS["addr"]))
         e = ttk.Entry(bar, textvariable=self.addr_var, width=24, font=(mono, 10))
         e.pack(side="left", padx=(10, 6))
         e.bind("<Return>", lambda ev: self._apply_addr())
         ttk.Button(bar, text="应用", command=self._apply_addr).pack(side="left")
         tk.Label(bar, text="(mDNS 名,IP 变了也不用改)", bg=self.C_CARD,
                  fg=self.C_TEXT_DIM, font=(ui, 9)).pack(side="left", padx=(10, 0))
+        # 恢复默认 + 显示设置文件位置:用户得知道工具往哪儿写了东西
+        ttk.Button(bar, text="恢复默认", width=9,
+                   command=self._reset_settings).pack(side="right")
 
         # 四张卡片。usbip 与 at32 是**同一套底座**(usbip 把设备挂成本地 USB,
         # at32 用带 AT32 flash 驱动的 openocd 去烧),所以放相邻并注明依赖关系。
@@ -2564,7 +2898,8 @@ class App:
         trow.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(trow, text="OpenOCD 目标芯片", bg=self.C_CARD, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
-        self.target_var = tk.StringVar(value="stm32f1x")
+        self.target_var = tk.StringVar(
+            value=self._settings.get("target", DEFAULT_SETTINGS["target"]))
         self.target_combo = ttk.Combobox(trow, textvariable=self.target_var,
                                          width=22, font=(mono, 10))
         self.target_combo.pack(side="left", padx=(10, 6))
@@ -2579,7 +2914,8 @@ class App:
         arow.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(arow, text="AT32 目标芯片", bg=self.C_CARD, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
-        self.at32_var = tk.StringVar(value="at32f403axG")
+        self.at32_var = tk.StringVar(
+            value=self._settings.get("at32_target", DEFAULT_SETTINGS["at32_target"]))
         self.at32_combo = ttk.Combobox(arow, textvariable=self.at32_var,
                                        width=22, font=(mono, 10))
         self.at32_combo.pack(side="left", padx=(10, 6))
@@ -2838,7 +3174,73 @@ class App:
             "target/%s.cfg" % self.target_var.get(),
             on_line=lambda s: self.events.put(("log", (s, "openocd"))))
         self._log("OpenOCD 目标改为 %s" % self.target_var.get(), "sys")
+        self._persist_settings()
         self._refresh_backends()
+
+    def _persist_settings(self) -> None:
+        """把当前的地址/target 存进 settings.json。
+
+        只在值真的变了才写 —— _apply_addr 之类会被频繁调用,每次都写盘
+        既没必要也会刷 mtime(备份软件会以为文件一直在变)。
+
+        **全部是默认值时删掉文件**,而不是写一份"和默认一样"的 JSON:
+        用户在「恢复默认」之后该真的回到"没有设置文件"的状态,否则下次
+        启动虽然行为一样,但文件还在,看起来像没重置成功。
+        (实测过:恢复默认删掉文件后 _apply_addr 会立刻把它写回来。)
+
+        写失败**不弹窗**:设置存不下来不影响本次使用(内存里已经生效),
+        而且每次改地址都弹一次会很烦。只在日志里留一行。
+        """
+        cur = {
+            "addr": self.addr_var.get().strip(),
+            "target": self.target_var.get().strip(),
+            "at32_target": self.at32_var.get().strip(),
+        }
+        if cur == self._settings_saved:
+            return
+        if cur == dict(DEFAULT_SETTINGS):
+            ok, detail = delete_settings_file()
+            if ok:
+                self._settings = {}
+                self._settings_saved = {}
+                self._log("设置已回到默认,设置文件已删除", "sys")
+            else:
+                self._log("设置文件删除失败(本次仍用默认值):%s" % detail, "sys")
+            return
+        ok, detail = save_settings(cur)
+        if ok:
+            self._settings = cur
+            self._settings_saved = dict(cur)
+            self._log("已记住设置(下次启动沿用):%s" % detail, "sys")
+        else:
+            self._log("设置没能存下来(本次仍然有效):%s" % detail, "sys")
+
+
+    def _reset_settings(self) -> None:
+        """恢复默认:删掉 settings.json 并把界面变量恢复出厂值。
+
+        不重启工具 —— 用户点完就能看到地址框变回 dap.local。已经建好的
+        后端对象要跟着重建,否则内部还连着旧地址。
+        """
+        try:
+            p = settings_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as exc:
+            self._show_result("删除设置文件失败:%s" % exc, "err")
+            return
+        self.addr_var.set(DEFAULT_SETTINGS["addr"])
+        self.target_var.set(DEFAULT_SETTINGS["target"])
+        self.at32_var.set(DEFAULT_SETTINGS["at32_target"])
+        self._settings = {}
+        self._settings_saved = {}
+        # 让后端真的切回默认地址
+        try:
+            self._apply_addr()
+        except Exception:
+            pass
+        self._log("已恢复默认设置(设备地址 dap.local / target stm32f1x、"
+                  "at32f403axG),设置文件已删除", "ok")
 
     def _apply_addr(self) -> None:
         addr = self.addr_var.get().strip()
@@ -2853,6 +3255,7 @@ class App:
             addr, "target/%s.cfg" % self.target_var.get(),
             on_line=lambda s: self.events.put(("log", (s, "openocd"))))
         self._log("设备地址改为 %s" % addr, "sys")
+        self._persist_settings()
         self._refresh_backends()
 
     def _on_at32_target_change(self) -> None:
@@ -2861,6 +3264,7 @@ class App:
             return
         bm.set_at32_target("target/%s.cfg" % self.at32_var.get())
         self._log("AT32 目标改为 %s" % self.at32_var.get(), "sys")
+        self._persist_settings()
         self._refresh_backends()
 
     def _copy_cmd(self, key: str) -> None:
@@ -3544,24 +3948,126 @@ class App:
                 "检查路由器;或者点「扫描 WiFi」手动换一个网络。" if st.mode == "STA" else "")
 
     def _show_ap_hint(self, st: Status) -> None:
+        """AP 模式的结果面板。
+
+        密码不再硬编码:向板子要 @AP。老固件(<=0.7.x)没有这条命令,
+        会回 404 —— 那时只能退回"提示用户看板子标签/手册"的说法,绝不能
+        再把 12345678 当成"当前密码"显示出来(那正是我们要消掉的隐患)。
+        """
+        info = None
+        try:
+            if self.client is not None:
+                info = self.client.ap_get()
+        except Exception:
+            info = None
+
+        if info is not None:
+            pwd_line = "  密码:%s   (本机随机生成,已存在板子里)\n" % info.password
+            step_line = "  1) 用电脑或手机的 WiFi 连上「%s」(密码 %s)\n" % (
+                info.ssid, info.password)
+            extra = ""
+        else:
+            pwd_line = ("  密码:这一版固件不支持 @AP,读不到随机密码。\n"
+                        "        请升级到 v0.8.0+,或看板子背面的标签。\n")
+            step_line = "  1) 用电脑或手机的 WiFi 连上「%s」\n" % st.ssid
+            extra = ("\n> 老固件(≤0.7.x)的 AP 密码是公开常量 12345678,\n"
+                     "> 强烈建议升级到 v0.8.0 使用随机密码。\n")
+
         self._show_result(
             "当前:AP 模式(板子自己发热点)\n"
             "\n"
             "  热点:%s\n"
-            "  密码:%s\n"
+            "%s"
             "  板子地址:%s\n"
             "\n"
             "接下来:\n"
-            "  1) 用电脑或手机的 WiFi 连上「%s」(密码 %s)\n"
+            "%s"
             "  2) 调试端口照常:%s:%d(usbip)、%s:%d(串口桥)\n"
+            "%s"
             "\n"
             "注意:\n"
             "  · AP 模式没有外网,连上后不能上网,这是正常的\n"
             "  · AP 模式下扫不了 WiFi(自己就是热点),要扫描请先切回 STA\n"
-            "  · AP 模式只是「没有路由器时的兜底」,日常用 STA"
-            % (st.ssid, AP_DEFAULT_PASSWORD, st.ip,
-               st.ssid, AP_DEFAULT_PASSWORD,
-               st.ip, PORT_USBIP, st.ip, PORT_UART_BRIDGE), "info")
+            "  · 密码是设备身份,恢复出厂不会改它;要换用「重新生成 AP 密码」"
+            % (st.ssid, pwd_line, st.ip, step_line,
+               st.ip, PORT_USBIP, st.ip, PORT_UART_BRIDGE, extra), "info")
+
+    def _show_ap_password(self) -> None:
+        """读并显示当前 AP 热点密码(用户主动点才查,不放进例行刷新)。"""
+        if self.client is None:
+            self._show_result("还没连上设备", "err")
+            return
+        self.submit("读取 AP 密码", self.client.ap_get,
+                    self._after_show_ap_password)
+
+    def _after_show_ap_password(self, result, err) -> None:
+        if err is not None:
+            self._show_result("读取失败:%s" % err, "err")
+            return
+        info = result
+        if info is None:
+            self._show_result(
+                "这块板子的固件不支持 @AP(需要 v0.8.0+)。\n\n"
+                "老固件的 AP 密码是公开常量 12345678 —— 也就是说谁都能连上\n"
+                "它的热点。建议升级固件,用随机密码。", "warn")
+            return
+        self._show_result(
+            "当前 AP 热点\n"
+            "\n"
+            "  名称:%s\n"
+            "  密码:%s\n"
+            "\n"
+            "这个密码是板子首次开机时随机生成的,存在板子里,断电不丢。\n"
+            "恢复出厂设置**不会**改它(密码属于设备身份,不是用户配置)。\n"
+            "\n"
+            "注意:只有切到 AP 模式时这个热点才存在;STA 模式下它不广播。"
+            % (info.ssid, info.password), "info")
+
+    def _regen_ap_password(self) -> None:
+        """重新生成 AP 密码(带确认)。
+
+        为什么需要确认:换掉之后**所有已经连上这个热点的设备都会掉线**,
+        而且旧密码立刻作废。这不是一个该被误点的按钮。
+        """
+        if self.client is None:
+            self._show_result("还没连上设备", "err")
+            return
+        if not self._messagebox.askyesno(
+                "重新生成 AP 密码",
+                "确定要换一个新的热点密码吗?\n\n"
+                "换掉之后,所有已经连上这个热点的设备都会掉线,\n"
+                "旧密码立刻作废,需要重新输入新密码。\n\n"
+                "（新密码会存在板子里,断电不丢）"):
+            return
+        self.submit("重新生成 AP 密码", self.client.ap_regen,
+                    self._after_regen_ap)
+
+    def _after_regen_ap(self, result, err) -> None:
+        if err is not None:
+            self._show_result("重新生成失败:%s" % err, "err")
+            return
+        info = result
+        if info is None:
+            self._show_result(
+                "板子不支持 @AP REGEN。\n\n"
+                "这条命令是 v0.8.0 新增的,请升级固件后重试。", "err")
+            return
+        self._log("AP 密码已重新生成:%s" % info.password, "ok")
+        self._show_result(
+            "新的 AP 热点密码:%s\n"
+            "\n"
+            "板子上的密码已经换好了。\n"
+            "%s"
+            "\n"
+            "下一步:\n"
+            "  · 如果板子现在是 AP 模式:先切一次模式(或重启板子),新密码生效\n"
+            "  · 如果板子现在是 STA 模式:下次切到 AP 模式时自动用新密码\n"
+            "\n"
+            "记得把新密码记下来 —— 恢复出厂不会还原密码,丢了只能用\n"
+            "USB 连上板子再生成一个。"
+            % (info.password,
+               "(固件已提示:applies_on_next_mode_switch)"
+               if info.note else ""), "ok")
 
     # --- 指示灯亮度 --------------------------------------------------
     def _apply_led_value(self, pct: Optional[int]) -> None:
