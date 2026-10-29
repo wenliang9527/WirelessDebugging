@@ -133,7 +133,13 @@ python capture_boot.py
 pip install -r requirements.txt      # 首次:装 pyserial / pyinstaller / pillow
 python build_package.py              # 产物在 tools/dist/无线调试器/
 python build_package.py --skip-exe   # 只重组工具目录,不重跑 PyInstaller
+python build_package.py --selftest   # 只跑凭据泄露检查的双向自测(5 项,不打包)
 ```
+
+`smoke_check` 在打包最后一道会拦:缺 exe/工具/驱动脚本/许可证、GPL 全文版本
+对不上、以及**固件 bin 里混进了本机私有 WiFi 凭据**(`check_no_credentials`)。
+最后一项是因为 `main/wifi_credentials.h` 是 gitignore 的本地文件,带着自己家
+WiFi 编出来的 bin 会被原样打进交付包 —— 那种事故只能靠机器校验拦。
 
 产物结构:
 
