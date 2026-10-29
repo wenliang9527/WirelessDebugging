@@ -279,7 +279,27 @@ def _builtin_firmware_literals(main_dir: str) -> set:
     return lits
 
 
-def check_no_credentials(fw_bin: str) -> list:
+def is_builtin_literal(s: str, builtin: set) -> bool:
+    """s 是否其实是固件自带的东西(内置常量,不是用户私有凭据)。
+
+    提成模块级函数而不是 check_no_credentials 里的闭包,是为了让
+    --selftest 能**直接调用被测逻辑**。上一版把判据抄进测试里,
+    把 bug 注入回去测试照样全绿 —— 假绿。现在测试调用本函数。
+
+    判据是**单向**的:s 必须是某个内置字面量的子串。
+      "DAP"      ⊂ "DAP-"          -> 内置
+      "OTA"      ⊂ "corsacOTA"     -> 内置
+      "12345678" == AP_PASSWORD    -> 内置
+    反过来(b 是 s 的子串)绝对不行:那会让 "dap_my_router" 因为含 "dap"、
+    "password123" 因为含 "pass" 被当成内置常量而**漏报** —— 这恰恰是
+    这个检查最该抓住的那类私有凭据(用户起名常带 dap/wifi/password)。
+    """
+    if s in builtin:
+        return True
+    return any(s in b for b in builtin if len(b) >= 3)
+
+
+def check_no_credentials(fw_bin: str, secrets=None) -> list:
     """确认要发出去的固件 bin 里**不含**本机私有 WiFi 凭据。
 
     为什么必须有这一步:main/wifi_credentials.h 是 gitignore 的本地文件,
@@ -291,39 +311,35 @@ def check_no_credentials(fw_bin: str) -> list:
     (即它是这个文件独有的,也就是用户私有的),就不许出现在 bin 里。
     这样 12345678(AP 热点密码)、DAP/OTA(内置常量)不会被误报。
 
+    secrets:仅供自测注入假的凭据列表;为 None 时从 wifi_credentials.h 读。
+    有这个参数是为了让 --selftest 能走**真实代码路径**验判据 —— 把判据
+    抄进测试里就是假绿。
+
     返回问题列表(空 = 干净)。找不到凭据文件时跳过(交付机上通常没有)。
     """
     problems = []
     main_dir = os.path.normpath(os.path.join(SRC_FIRMWARE, "..", "main"))
     cred = os.path.join(main_dir, "wifi_credentials.h")
-    if not os.path.isfile(cred) or not os.path.isfile(fw_bin):
+    if not os.path.isfile(fw_bin):
         return problems
-    try:
-        text = open(cred, encoding="utf-8", errors="replace").read()
-    except Exception:
-        return problems
-    import re as _re
+    if secrets is None:
+        if not os.path.isfile(cred):
+            return problems
+        try:
+            text = open(cred, encoding="utf-8", errors="replace").read()
+        except Exception:
+            return problems
+        import re as _re
+        secrets = []
+        for m in _re.finditer(r'\.ssid\s*=\s*"([^"]*)"', text):
+            secrets.append(m.group(1))
+        for m in _re.finditer(r'\.password\s*=\s*"([^"]*)"', text):
+            secrets.append(m.group(1))
     builtin = _builtin_firmware_literals(main_dir)
-    secrets = []
-    for m in _re.finditer(r'\.ssid\s*=\s*"([^"]*)"', text):
-        secrets.append(m.group(1))
-    for m in _re.finditer(r'\.password\s*=\s*"([^"]*)"', text):
-        secrets.append(m.group(1))
     blob = open(fw_bin, "rb").read()
-    def _is_builtin(s: str) -> bool:
-        """s 是否其实是固件自带的东西。
-
-        不能只做"完全相等"比较 —— 实测 "DAP" 单看不在字面量集合里,但它是
-        "DAP-"(组装 AP 热点名)和 "DAP mDNS" 的子串,bin 里当然会有;
-        "OTA" 同理是 "corsacOTA" 的子串;"12345678" 则完全等于 AP_PASSWORD。
-        所以按"是某个内置字面量的子串,或内置字面量是它的子串"来判。
-        """
-        if s in builtin:
-            return True
-        return any(s in b or b in s for b in builtin if len(b) >= 3)
 
     for s in secrets:
-        if len(s) < 3 or _is_builtin(s):
+        if len(s) < 3 or is_builtin_literal(s, builtin):
             continue      # 太短 / 固件内置常量,不是私有凭据
         if s.encode("utf-8") in blob:
             problems.append(
@@ -396,12 +412,97 @@ def smoke_check(pkg_root: str) -> None:
     print("  结构完整,共 %.0f MB" % (total / 1e6))
 
 
+def run_selftest() -> int:
+    """check_no_credentials 的双向自测(不需要真固件 bin,用临时文件造假)。
+
+    为什么单独放在这个文件里:dap_config.py 的 --selftest 只 import
+    dap_config 自己,看不到 build_package 的检查逻辑。凭据泄露检查一旦
+    回归就是"把自家 WiFi 密码发给所有客户"级别的事故,必须有能抓住它的
+    测试 —— 而且必须**双向**:既能抓到真泄露,也不能把固件内置常量
+    误报成泄露(第一版就是全误报)。
+    """
+    import tempfile
+    tin = []
+    tout = []
+
+    def chk(name, ok, detail=""):
+        tin.append(1)
+        if not ok:
+            tout.append((name, detail))
+
+    main_dir = os.path.normpath(os.path.join(SRC_FIRMWARE, "..", "main"))
+    cred = os.path.join(main_dir, "wifi_credentials.h")
+    if not os.path.isfile(cred):
+        print("跳过:开发机上没有 %s,无法测凭据检查" % cred)
+        print("(该文件是 gitignore 的本地文件,交付机上本来就没有)")
+        return 0
+
+    import re as _re
+    text = open(cred, encoding="utf-8", errors="replace").read()
+    real = [m.group(1) for m in
+            _re.finditer(r'\.(?:ssid|password)\s*=\s*"([^"]*)"', text)]
+    builtin = _builtin_firmware_literals(main_dir)
+
+    tmp = os.path.join(tempfile.gettempdir(), "_bp_selftest.bin")
+    try:
+        # --- 方向一:bin 里真有私有凭据 -> 必须报出来 -------------------
+        priv = [s for s in real if len(s) >= 3
+                and not is_builtin_literal(s, builtin)]
+        if priv:
+            open(tmp, "wb").write(b"\x00".join(s.encode("utf-8") for s in real))
+            got = check_no_credentials(tmp)
+            chk("真泄露能被抓到", bool(got), "priv=%r got=%r" % (priv, got))
+            chk("报出的是私有那条", any(priv[0] in g for g in got), str(got))
+        else:
+            chk("真泄露能被抓到", False, "凭据文件里没有可用的私有项")
+
+        # --- 方向二:bin 只含内置常量 -> 不许误报 -----------------------
+        clean = "".join(sorted(builtin, key=len, reverse=True)[:40])
+        open(tmp, "wb").write(clean.encode("utf-8"))
+        got2 = check_no_credentials(tmp)
+        chk("内置常量不误报", not got2, str(got2))
+
+        # --- 方向三:含内置词的私有凭据仍要报(端到端)-------------------
+        # 回归:第一版用 "b in s or s in b" 双向子串判断,"dap_my_router"
+        # 因为含 "dap"、"password123" 因为含 "pass" 都被当成内置而漏报。
+        # 这里必须走 check_no_credentials 的真路径(secrets 参数注入),
+        # 不能把判据抄进测试里 —— 那正是审核点名的"假绿"。
+        fakes = ["dap_xxxxx", "password123"]
+        open(tmp, "wb").write(b"\x00".join(s.encode() for s in fakes))
+        got3 = check_no_credentials(tmp, secrets=fakes)
+        chk("含内置词的私有凭据不被漏报",
+            len(got3) == len(fakes),
+            "got=%r" % (got3,))
+
+        # --- 方向四:内置常量即使真在 bin 里也不报(回归误报)-----------
+        builtin_hits = ["DAP", "OTA", "12345678"]
+        open(tmp, "wb").write(b"\x00".join(s.encode() for s in builtin_hits))
+        got4 = check_no_credentials(tmp, secrets=builtin_hits)
+        chk("内置常量即使真在 bin 里也不报", not got4, str(got4))
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    print("=" * 72)
+    for name, detail in tout:
+        print("  FAIL  " + name + (("   <- " + detail) if detail else ""))
+    print("共 %d 项,%d 通过,%d 失败"
+          % (len(tin), len(tin) - len(tout), len(tout)))
+    return 1 if tout else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=os.path.join(HERE, "dist"))
     ap.add_argument("--skip-exe", action="store_true",
                     help="只组装工具目录,不重跑 PyInstaller(调打包布局用)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="只跑凭据泄露检查的双向自测,不打包")
     args = ap.parse_args()
+    if args.selftest:
+        return run_selftest()
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
