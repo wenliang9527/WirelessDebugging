@@ -91,7 +91,7 @@ ERR_INFO: Dict[int, ErrInfo] = {
     400: ErrInfo("命令参数不对", "工具发的命令固件没看懂。", "多半是工具版本与固件不匹配,请更新工具或固件。"),
     404: ErrInfo("固件不支持这条命令",
                  "板子上的固件还是配网功能之前的老版本。",
-                 "烧写 v0.7.0 或更新的固件(见 03_firmware/固件烧录指南.md)。"),
+                 "烧写 v0.7.2 或更新的固件(见 03_firmware/固件烧录指南.md)。"),
     405: ErrInfo("设备还在启动",
                  "板子刚上电,WiFi 还没初始化完,这个窗口期不允许切换模式。",
                  "等 20 秒左右再点一次。"),
@@ -441,7 +441,7 @@ class MockTransport(Transport):
         self._emit("I (1234) mock: got @%s" % cmd, 0.0)
 
         if cmd == "PING":
-            self._emit("@OK pong fw=0.7.0 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
+            self._emit("@OK pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
         elif cmd == "STATUS":
             if self._mode == "AP":
                 self._emit("@OK mode=AP ip=%s ssid=DAP-EEFC" % AP_DEFAULT_IP, 0.02)
@@ -1070,8 +1070,8 @@ def run_selftest() -> int:
     st5 = parse_status("mode=STA ssid=MyWiFi ip=192.168.7.125 rssi=-50 ch=6 prov=0")
     check("STA prov=0 非未配网", st5 is not None and st5.prov is False, repr(st5))
 
-    p = parse_ping("pong fw=0.7.0 mac=AA:BB:CC:DD:EE:FC mode=STA")
-    check("PING 帧", p is not None and p.fw == "0.7.0"
+    p = parse_ping("pong fw=0.7.2 mac=AA:BB:CC:DD:EE:FC mode=STA")
+    check("PING 帧", p is not None and p.fw == "0.7.2"
           and p.mac == "AA:BB:CC:DD:EE:FC" and p.mode == "STA", repr(p))
 
     ck = RE_CONNECT_OK.match("connected ssid=MyWiFi ip=192.168.7.125")
@@ -1114,7 +1114,7 @@ def run_selftest() -> int:
     client.open()
     try:
         info = client.ping()
-        expect_eq("PING fw", info.fw, "0.7.0")
+        expect_eq("PING fw", info.fw, "0.7.2")
         st = client.status()
         check("初始 STA", st.mode == "STA", repr(st))
 
