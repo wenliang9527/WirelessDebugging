@@ -1605,6 +1605,61 @@ def run_selftest() -> int:
         check("@AP 未知子命令 -> 400", (not r.ok) and r.code == 400,
               "%s %s" % (r.code, r.text))
 
+        # --- GUI 必须真的把密码显示出来 -------------------
+        # 协议层能读到 ≠ 用户看得见。这两条走 GUI 的真实回调,不是复制逻辑:
+        # 只验证"文字里含密码"和"显示的确实是当前密码",不钉排版细节。
+        class _Screen:
+            """假的结果面板:只记录被写进去的文字。"""
+            def __init__(self):
+                self.shown = []
+                self.state = None
+
+            def configure(self, **kw):
+                pass
+
+            def delete(self, *a):
+                self.shown = []
+
+            def yview_moveto(self, *_a):
+                pass
+
+            def insert(self, _where, text, *tags):
+                self.shown.append(text)
+
+            def text(self):
+                return "".join(self.shown)
+
+        class _FakeApp:
+            _show_result = App._show_result
+            _after_show_ap_password = App._after_show_ap_password
+            _after_regen_ap = App._after_regen_ap
+            _log = lambda self, msg, tag="sys": None
+
+        fake = _FakeApp()
+        fake.result = _Screen()
+        fake._after_show_ap_password(ap3, None)
+        shown = fake.result.text()
+        check("GUI 显示 AP 密码", ap3 is not None and ap3.password in shown,
+              "面板文字里找不到 %r: %r" % (ap3.password if ap3 else None, shown[:120]))
+        check("GUI 显示的 SSID 正确", ap3 is not None and ap3.ssid in shown,
+              repr(shown[:120]))
+
+        fake.result = _Screen()
+        fake._after_show_ap_password(None, None)
+        old_fw = fake.result.text()
+        # 老固件分支只允许把 12345678 当"别再用这个"的警告词,不允许当当前密码。
+        # 判据用"有没有把它挂在『密码:』后面"——那才是用户会照着去连热点的位置。
+        check("老固件不把 12345678 当当前密码",
+              "密码:12345678" not in old_fw and "密码: 12345678" not in old_fw,
+              "把公开常量当成当前密码显示了: %r" % old_fw[:160])
+        check("老固件明确提示升级", "0.8" in old_fw, repr(old_fw[:120]))
+
+        fake.result = _Screen()
+        fake._after_regen_ap(ap2, None)
+        regen_shown = fake.result.text()
+        check("GUI 显示 REGEN 后的新密码",
+              ap2 is not None and ap2.password in regen_shown, repr(regen_shown[:120]))
+
         r = client.request("@NOSUCHCMD", 2.0)
         check("未知命令 -> 404", (not r.ok) and r.code == 404, "%s %s" % (r.code, r.text))
 
