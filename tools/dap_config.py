@@ -405,10 +405,30 @@ def parse_ping(body: str) -> Optional[DeviceInfo]:
 
 @dataclass
 class ApInfo:
-    """@AP 的应答。note 非空表示"密码已换、下次切模式生效"。"""
-    ssid: str
-    password: str
+    """@AP 的应答。note 非空表示"密码已换、下次切模式生效"。
+
+    code/err 只在**读失败**时有意义(成功时恒为 0/空):
+      code=0    读到了密码,ssid/password 有效
+      code=404  固件没有 @AP 这条命令(<=0.7.x)—— "老固件",该建议升级
+      code=408  命令发出去了没回话 —— 超时,和固件新旧无关
+    区分这两者不是洁癖:早先失败一律返回 None,界面就把"板子没回话"
+    也说成"固件太老,请升级 v0.8.0+";用户照做升完级还是连不上,
+    排查方向被彻底带偏。错误要能分层,界面才说得出人话。
+    """
+    ssid: str = ""
+    password: str = ""
     note: str = ""
+    code: int = 0
+    err: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.code == 0
+
+    @property
+    def missing_command(self) -> bool:
+        """固件不认识 @AP(而不是这一条没读到)。"""
+        return self.code == 404
 
 
 def parse_ap(body: str) -> Optional[ApInfo]:
@@ -1005,6 +1025,10 @@ class DapClient:
 
             deadline = time.monotonic() + timeout
             data: List[str] = []
+            # 本条命令期间是否丢弃过"上一条的残留终结帧"。
+            # 丢了就说明:上一条的应答确实到了(正常),或者它根本没来过而我方
+            # 误吞了本条的应答。两者靠"本条是否也超时"来区分 —— 见超时分支。
+            ate_stale = False
             while True:
                 remain = deadline - time.monotonic()
                 if remain <= 0:
@@ -1017,8 +1041,29 @@ class DapClient:
                     # 实测判据用 _ever_ok(曾成功应答过)时 probe_port 3.83s,
                     # 与改前一致;用"帧计数>0"会漏记(超时那刻迟到帧还没到)。
                     if self._ever_ok:
-                        self._stale_owed += 1
-                        self._stale_expire = time.monotonic() + 30.0
+                        if ate_stale:
+                            # **自愈**:本条期间已经丢掉过一个"上一条的残留
+                            # 终结帧",而本条自己仍然超时 —— 说明那笔旧账其实
+                            # 永远不会来了(板子复位 / 串口丢字节),刚才被吞掉
+                            # 的就是本条自己的应答。
+                            # 若此时继续 += 1 就进入永久死锁:
+                            #   账恒为 1 -> 每条命令的首个终结帧都被当残留吃掉
+                            #   -> 每条命令都 408 -> 只能重插 USB。
+                            # 实测连续 5 条 PING 全 408,而板子一条都没漏回;
+                            # 30s 过期也救不了,因为每次超时都把 expire 刷成
+                            # now+30,永远等不到过期。
+                            # 所以这里清零:代价是这一条失败一次,下一条恢复
+                            # (实测 1 条失败后即恢复)。
+                            self._stale_owed = 0
+                            if self.on_log:
+                                try:
+                                    self.on_log("上一条超时命令的应答不会再来了,"
+                                                "清空欠账(本条很可能误吞了自己的应答)")
+                                except Exception:
+                                    pass
+                        else:
+                            self._stale_owed += 1
+                            self._stale_expire = time.monotonic() + 30.0
                     return Reply(ok=False, code=408, text="TIMEOUT", data=data)
                 try:
                     frame = self._frames.get(timeout=min(remain, 1.0))
@@ -1046,6 +1091,7 @@ class DapClient:
                     # 长阻塞命令仍会串味,已实测复现后改成计数。
                     if self._stale_owed:
                         self._stale_owed -= 1
+                        ate_stale = True
                         if self.on_log:
                             try:
                                 self.on_log("丢弃上一条超时命令的残留 %s:%s"
@@ -1123,6 +1169,10 @@ class DapClient:
             "LED": ("led",),
             "REBOOT": ("rebooting",),
             "FACTORY": ("rebooting",),
+            # @AP 是 0.8.0 新增的(读/重置 AP 热点密码)。
+            # 未登记时这里会走"保守放行",而唯一依赖它的场景就是
+            # "上一条超时后的残留"——那条路上放行等于没保护,所以补上。
+            "AP": ("ap ssid=",),
         }
         heads = expect.get(cmd)
         if not heads:
@@ -1204,27 +1254,34 @@ class DapClient:
     def led_set(self, pct: int) -> Reply:
         return self.request("@LED %d" % int(pct), 6.0)
 
-    def ap_get(self) -> Optional[ApInfo]:
+    def ap_get(self) -> ApInfo:
         """读 AP 热点 SSID 与密码(v0.8+)。
 
-        老固件没有 @AP,会回 404 —— 此时返回 None,让界面走"读不到"分支,
-        而不是把 404 当成错误弹窗(对老固件来说是正常现象)。
+        **总是**返回 ApInfo,失败时用 code/err 说明原因,不要返回 None:
+          - 404 = 老固件没有 @AP(正常现象,界面该提示升级)
+          - 408 = 命令发出去没回话(和固件新旧无关,该提示重试)
+        两者混成一个 None 会让界面把超时说成"固件太老",指错方向。
         """
-        r = self.request("@AP", 4.0)
-        if not r.ok:
-            return None
-        return parse_ap(r.text)
+        return self._ap_request("@AP", 4.0)
 
-    def ap_regen(self) -> Optional[ApInfo]:
-        """重新生成 AP 密码。返回新密码,失败返回 None。
+    def ap_regen(self) -> ApInfo:
+        """重新生成 AP 密码。成功时返回新密码,失败时 code/err 说明原因。
 
         注意:新密码要等下一次切模式/重启才真正生效 —— 固件在应答的
         note= 字段里写明这一点,界面必须如实转述,不能让用户以为立刻生效。
         """
-        r = self.request("@AP REGEN", 8.0)
+        return self._ap_request("@AP REGEN", 8.0)
+
+    def _ap_request(self, line: str, timeout: float) -> ApInfo:
+        r = self.request(line, timeout)
         if not r.ok:
-            return None
-        return parse_ap(r.text)
+            return ApInfo(code=r.code or 500, err=r.text)
+        info = parse_ap(r.text)
+        if info is None:
+            # 应答到了但看不懂 —— 既不是"没这个命令",也不是超时。
+            # 单独给 500,别让它冒充 404 去劝人升级固件。
+            return ApInfo(code=500, err="响应格式不认识: %s" % r.text)
+        return info
 
     def factory_reset(self) -> Reply:
         r = self.request("@FACTORY", 5.0)
@@ -1581,25 +1638,86 @@ def run_selftest() -> int:
 
         # --- @AP:随机 AP 密码(v0.8+)-----------------------
         ap = client.ap_get()
-        check("AP 信息能读到", ap is not None and ap.ssid.startswith("DAP-"),
-              repr(ap))
+        check("AP 信息能读到", ap.ok and ap.ssid.startswith("DAP-"), repr(ap))
         check("AP 密码不是公开常量 12345678",
-              ap is not None and ap.password != "12345678",
-              repr(ap.password if ap else None))
-        check("AP 密码长度 10", ap is not None and len(ap.password) == 10,
-              repr(ap.password if ap else None))
-        old_pass = ap.password if ap else None
+              ap.ok and ap.password != "12345678", repr(ap.password))
+        check("AP 密码长度 10", ap.ok and len(ap.password) == 10,
+              repr(ap.password))
+        old_pass = ap.password
 
         ap2 = client.ap_regen()
-        check("REGEN 返回新密码", ap2 is not None and ap2.password != old_pass,
-              "%r -> %r" % (old_pass, ap2.password if ap2 else None))
+        check("REGEN 返回新密码", ap2.ok and ap2.password != old_pass,
+              "%r -> %r" % (old_pass, ap2.password))
         check("REGEN 带 note 说明",
-              ap2 is not None and "applies_on_next" in ap2.note, repr(ap2))
+              ap2.ok and "applies_on_next" in ap2.note, repr(ap2))
         # 生成后 get 必须返回新值(证明写进了板子,而不是只回一次)
         ap3 = client.ap_get()
         check("REGEN 后 get 返回新密码",
-              ap3 is not None and ap3.password == (ap2.password if ap2 else ""),
-              repr(ap3))
+              ap3.ok and ap3.password == ap2.password, repr(ap3))
+
+        r = client.request("@AP BOGUS", 2.0)
+        check("@AP 未知子命令 -> 400", (not r.ok) and r.code == 400,
+              "%s %s" % (r.code, r.text))
+
+        # --- 读 AP 失败时,错误必须分层 ---------------------
+        # 回归:早先失败一律返回 None,界面把"超时"也说成"固件太老请升级"。
+        # 用户照做升完级仍然连不上 —— 这是把人往错方向推。
+        class _ApErr(Transport):
+            """只回一条固定终结帧的假设备,用来分别造 404 / 超时。"""
+            name = "APERR"
+
+            def __init__(self, frame):
+                self._frame = frame
+                self._open = False
+                self._q: List[Tuple[float, str]] = []
+
+            def open(self):
+                self._open = True
+
+            def close(self):
+                self._open = False
+
+            @property
+            def is_open(self):
+                return self._open
+
+            def write(self, data):
+                if b"@AP" in data and self._frame:
+                    self._q.append((time.monotonic() + 0.02, self._frame))
+
+            def read(self, size=4096, timeout=0.05):
+                time.sleep(0.01)
+                now = time.monotonic()
+                ready = [ln for (t0, ln) in self._q if t0 <= now]
+                self._q = [(t0, ln) for (t0, ln) in self._q if t0 > now]
+                return ("\n".join(ready) + "\n").encode() if ready else b""
+
+        c_old = DapClient(_ApErr("@ERR 404 AP"))
+        c_old.open()
+        r404 = c_old.ap_get()
+        check("老固件 @AP 报 404", r404.code == 404, repr(r404))
+        check("404 才算『没有这条命令』", r404.missing_command, repr(r404))
+        c_old.close()
+
+        c_to = DapClient(_ApErr(None))
+        c_to.open()
+        r408 = c_to.ap_get()
+        check("没回话报 408", r408.code == 408, repr(r408))
+        check("超时不算『没有这条命令』", not r408.missing_command, repr(r408))
+        check("失败时 ok 为假", not r408.ok and not r404.ok, repr(r408))
+        c_to.close()
+
+        # 应答到了但格式不认识:既不能说成 404,也不能悄悄当成成功。
+        # 注意要选一条**能过形态判别**的帧("ap ssid=" 开头),否则它会被
+        # 当成迟到帧丢掉、最终报 408 —— 那是另一条路径(见形态判别自测)。
+        # 这里构造的是"形态对、字段不全":少了 pass=。
+        c_bad = DapClient(_ApErr("@OK ap ssid=DAP-EEFC"))
+        c_bad.open()
+        r_bad = c_bad.ap_get()
+        check("格式不认识报 500 而不是 404", r_bad.code == 500, repr(r_bad))
+        check("格式不认识不算『没有这条命令』", not r_bad.missing_command,
+              repr(r_bad))
+        c_bad.close()
 
         r = client.request("@AP BOGUS", 2.0)
         check("@AP 未知子命令 -> 400", (not r.ok) and r.code == 400,
@@ -1639,13 +1757,12 @@ def run_selftest() -> int:
         fake.result = _Screen()
         fake._after_show_ap_password(ap3, None)
         shown = fake.result.text()
-        check("GUI 显示 AP 密码", ap3 is not None and ap3.password in shown,
-              "面板文字里找不到 %r: %r" % (ap3.password if ap3 else None, shown[:120]))
-        check("GUI 显示的 SSID 正确", ap3 is not None and ap3.ssid in shown,
-              repr(shown[:120]))
+        check("GUI 显示 AP 密码", ap3.password in shown,
+              "面板文字里找不到 %r: %r" % (ap3.password, shown[:120]))
+        check("GUI 显示的 SSID 正确", ap3.ssid in shown, repr(shown[:120]))
 
         fake.result = _Screen()
-        fake._after_show_ap_password(None, None)
+        fake._after_show_ap_password(ApInfo(code=404, err="AP"), None)
         old_fw = fake.result.text()
         # 老固件分支只允许把 12345678 当"别再用这个"的警告词,不允许当当前密码。
         # 判据用"有没有把它挂在『密码:』后面"——那才是用户会照着去连热点的位置。
@@ -1654,11 +1771,118 @@ def run_selftest() -> int:
               "把公开常量当成当前密码显示了: %r" % old_fw[:160])
         check("老固件明确提示升级", "0.8" in old_fw, repr(old_fw[:120]))
 
+        # 超时(408)不是"固件太老"。混为一谈会让用户去升一个不需要升的固件。
+        fake.result = _Screen()
+        fake._after_show_ap_password(ApInfo(code=408, err="TIMEOUT"), None)
+        to_text = fake.result.text()
+        check("超时不说成固件太老", "0.8" not in to_text and "升级" not in to_text,
+              "超时被说成了要升级固件: %r" % to_text[:160])
+        check("超时说明了真实原因", "超时" in to_text or "回话" in to_text,
+              repr(to_text[:160]))
+
+        fake.result = _Screen()
+        fake._after_regen_ap(ApInfo(code=408, err="TIMEOUT"), None)
+        regen_to = fake.result.text()
+        check("REGEN 超时不说成固件太老",
+              "升级" not in regen_to, repr(regen_to[:160]))
+        # 换密码失败时最要紧的一句:旧密码没变,别让人以为被换掉了
+        check("REGEN 失败明确告知旧密码没变", "旧密码没有变" in regen_to,
+              repr(regen_to[:200]))
+
         fake.result = _Screen()
         fake._after_regen_ap(ap2, None)
         regen_shown = fake.result.text()
         check("GUI 显示 REGEN 后的新密码",
-              ap2 is not None and ap2.password in regen_shown, repr(regen_shown[:120]))
+              ap2.password in regen_shown, repr(regen_shown[:120]))
+
+        # --- 排版函数绝不能自己做 I/O ----------------------
+        # 回归:早先 _show_ap_hint 内部直接调 client.ap_get()。它被
+        # _drain_events / _after_mode 调用,而两者都在 Tk 主线程上 ——
+        # @AP 超时 4s,窗口就冻 4s(切到 AP 模式时还会连冻两次)。
+        # 判据:给一个"一被调用就记账"的假 client,排版后账面必须为空。
+        class _NoIO:
+            """任何串口调用都记一笔,用来证明排版路径没碰 I/O。"""
+            def __init__(self):
+                self.touched = []
+
+            def __getattr__(self, name):
+                def _hit(*a, **kw):
+                    self.touched.append(name)
+                    raise AssertionError("排版函数不该调 %s" % name)
+                return _hit
+
+        class _PaintApp(_FakeApp):
+            _show_ap_hint = App._show_ap_hint
+            _sta_summary = App._sta_summary
+
+        probe = _NoIO()
+        paint = _PaintApp()
+        paint.result = _Screen()
+        paint.client = probe
+        paint._show_ap_hint(Status(mode="AP", ip=AP_DEFAULT_IP, ssid="DAP-EEFC"),
+                            ap3)
+        check("AP 面板排版不碰串口", not probe.touched,
+              "排版时调了 %r" % (probe.touched,))
+        check("AP 面板把传进来的密码显示出来", ap3.password in paint.result.text(),
+              repr(paint.result.text()[:120]))
+
+        # 传 None(读失败)也不能自己去补读一次
+        paint.result = _Screen()
+        paint._show_ap_hint(Status(mode="AP", ip=AP_DEFAULT_IP, ssid="DAP-EEFC"),
+                            None)
+        check("AP 面板读失败也不自己补读", not probe.touched,
+              "排版时调了 %r" % (probe.touched,))
+        check("读失败不劝人升级固件", "升级" not in paint.result.text(),
+              repr(paint.result.text()[:160]))
+
+        # --- @AP 必须在 worker 线程上读 ---------------------
+        # 光"排版不碰 I/O"不够:如果没人读,面板永远显示"没读到"。
+        # 这条钉住读的位置 —— _refresh_state 里、且只在该读时读。
+        class _ApRec:
+            def __init__(self, code=0, pwd="K7M4RTW9XY"):
+                self.calls = 0
+                self._info = ApInfo(ssid="DAP-EEFC", password=pwd, code=code)
+
+            def status(self):
+                return Status(mode="AP", ip=AP_DEFAULT_IP, ssid="DAP-EEFC")
+
+            def ap_get(self):
+                self.calls += 1
+                return self._info
+
+            def __getattr__(self, name):
+                def _none(*a, **kw):
+                    return None
+                return _none
+
+        class _StateApp(_PaintApp):
+            _refresh_state = App._refresh_state
+            _after_state = App._after_state
+            _apply_status = lambda self, st: None
+            _apply_led_value = lambda self, v: None
+            _fill_saved = lambda self, rows, src: None
+
+        rec = _ApRec()
+        sa = _StateApp()
+        sa.client = rec
+        got = sa._refresh_state()
+        check("_refresh_state 会读 @AP", rec.calls == 1, "calls=%d" % rec.calls)
+        check("_refresh_state 把 AP 信息带出来",
+              len(got) == 5 and got[4] is rec._info, repr(got))
+        # 读到的密码要能一路走到面板上
+        sa.result = _Screen()
+        sa._after_state(got, None)
+        check("AP 密码从 worker 一路到达面板",
+              "K7M4RTW9XY" in sa.result.text(), repr(sa.result.text()[:160]))
+
+        # STA 模式下不该白发一条 @AP(每条命令都要等板子回话)
+        rec2 = _ApRec()
+        rec2.status = lambda: Status(mode="STA", ip="192.168.7.125", ssid="HomeWiFi")
+        sa2 = _StateApp()
+        sa2.client = rec2
+        got2 = sa2._refresh_state()
+        check("STA 模式不发 @AP", rec2.calls == 0, "calls=%d" % rec2.calls)
+        check("STA 模式 AP 位为空", len(got2) == 5 and got2[4] is None, repr(got2))
 
         r = client.request("@NOSUCHCMD", 2.0)
         check("未知命令 -> 404", (not r.ok) and r.code == 404, "%s %s" % (r.code, r.text))
@@ -1896,6 +2120,17 @@ def run_selftest() -> int:
               c3._looks_like_reply_to("@PING", "@OK", "pong fw=0.8.0"), "")
         check("未登记命令保守放行",
               c3._looks_like_reply_to("@FOO", "@OK", "whatever"), "")
+        # @AP 是 0.8.0 新增命令,形态表必须跟上。未登记虽然"保守放行",
+        # 但那条路正是"上一条超时后的残留"场景 —— 放行等于没保护。
+        check("AP 认自己的回复(@AP)",
+              c3._looks_like_reply_to("@AP", "@OK",
+                                      "ap ssid=DAP-EEFC pass=346789ABCD"), "")
+        check("AP 认自己的回复(@AP REGEN)",
+              c3._looks_like_reply_to("@AP REGEN", "@OK",
+                                      "ap ssid=DAP-EEFC pass=X "
+                                      "note=applies_on_next_mode_switch"), "")
+        check("AP 不认 STATUS 的回复",
+              not c3._looks_like_reply_to("@AP", "@OK", "mode=STA ssid=x"), "")
         c3.close()
 
         # --- 回归:@DATA 迟到帧不能串(形态判别挡不住)------------------
@@ -2067,6 +2302,41 @@ def run_selftest() -> int:
             # 笼统的"调试后端模块可用",排查时看不出是哪条挂了。
             check("排空残留帧时不能连销账帧一起扔", False, repr(exc)[:80])
         c8.close()
+
+        # --- 回归:一条应答真的丢失时,不能把整条连接毒死 --------------
+        # 计数欠账机制的边界:超时记 1 笔,下一条的首个终结帧被当残留吃掉。
+        # 若那笔旧应答**真的不会再来了**(板子复位 / 串口丢字节),而板子
+        # 之后一切正常,那么:吃掉本条的 @OK -> 本条超时 -> 再欠 1 -> 恒为 1
+        # -> 之后每条命令都 408,只能重插 USB。
+        # 实测过:连续 5 条 @PING 全 408,而板子一条都没漏回。
+        # 30s 过期也救不了 —— 每次超时都把 expire 刷成 now+30。
+        class _LostReply(_Scripted):
+            """第 2 条命令(SCAN)的应答永久丢失,之后一切正常。"""
+
+            def __init__(self):
+                super().__init__({})
+
+            def write(self, data):
+                self._writes += 1
+                if self._writes == 2:
+                    return          # 永久丢失
+                due = time.monotonic() + 0.02
+                self._q.append((due, "@OK pong fw=0.7.2 mac=AA mode=STA"))
+
+        tr_lost = _LostReply()
+        c9 = DapClient(tr_lost)
+        c9.open()
+        check("丢失测试的前置 PING 成功", c9.request("@PING", 0.5, retries=0).ok, "")
+        r_lost = c9.request("@SCAN", 0.3, retries=0)
+        check("丢失的那条命令确实超时", r_lost.code == 408, "%s" % r_lost.code)
+        check("超时后记了欠账", c9._stale_owed == 1, "owed=%r" % c9._stale_owed)
+        # 关键断言:之后必须**能恢复**,最多牺牲一条命令
+        codes = [c9.request("@PING", 0.5, retries=0).code for _ in range(4)]
+        check("丢失一笔应答不会毒死整条连接(后续能恢复)",
+              codes[-1] == 0, "后续四条 = %r(最后一条应为 0)" % (codes,))
+        check("恢复代价不超过一条命令",
+              codes.count(0) >= 3, "后续四条 = %r" % (codes,))
+        c9.close()
 
         # --- 回归:关窗后不得再碰已销毁的 Tk 控件 ---------------------
         # 真实现场:用户在慢任务(@CONNECT 最多 32s / 恢复出厂)期间关窗,
@@ -3744,7 +4014,7 @@ class App:
         self._after_state(result, err)
         if err is not None:
             return
-        st, _rows, _src, led = result
+        st, _rows, _src, led, _ap = result
         self._apply_led_value(led)
         if st.mode != "STA":
             return
@@ -3764,13 +4034,24 @@ class App:
             led = self.client.led_get()
         except Exception:
             pass
-        return st, rows, source, led
+        # AP 模式下顺便把密码读回来。
+        # **必须在这里读,不能在 _show_ap_hint 里读**:后者由 _drain_events /
+        # _after_mode 调用,两者都在 Tk 主线程上,而 @AP 是一条要等板子回话
+        # 的串口命令(超时 4s)。在主线程上等 4s = 界面完全冻住,连窗口都拖
+        # 不动。submit() 的注释写得很清楚:所有 I/O 都走这一条 worker 队列。
+        ap = None
+        if st.mode == "AP":
+            try:
+                ap = self.client.ap_get()
+            except Exception as exc:
+                ap = ApInfo(code=500, err=str(exc))
+        return st, rows, source, led, ap
 
     def _after_state(self, result, err, keep_result: bool = False) -> None:
         if err is not None:
             self._log("读取状态失败: %s" % err, "err")
             return
-        st, rows, source, led = result
+        st, rows, source, led, ap = result
         self._apply_status(st)
         self._apply_led_value(led)
         if rows is not None:
@@ -3779,7 +4060,7 @@ class App:
         if keep_result:
             return
         if st.mode == "AP":
-            self._show_ap_hint(st)
+            self._show_ap_hint(st, ap)
         else:
             self._show_result(self._sta_summary(st), "info")
 
@@ -4002,31 +4283,39 @@ class App:
                 "不会自动换网。\n\n"
                 "检查路由器;或者点「扫描 WiFi」手动换一个网络。" if st.mode == "STA" else "")
 
-    def _show_ap_hint(self, st: Status) -> None:
+    def _show_ap_hint(self, st: Status, info: Optional[ApInfo] = None) -> None:
         """AP 模式的结果面板。
 
-        密码不再硬编码:向板子要 @AP。老固件(<=0.7.x)没有这条命令,
-        会回 404 —— 那时只能退回"提示用户看板子标签/手册"的说法,绝不能
-        再把 12345678 当成"当前密码"显示出来(那正是我们要消掉的隐患)。
-        """
-        info = None
-        try:
-            if self.client is not None:
-                info = self.client.ap_get()
-        except Exception:
-            info = None
+        **这里只排版,不做 I/O。** 密码由调用方在 worker 线程读好传进来
+        (见 _refresh_state)。本函数经 _after_state 由 _drain_events 调用,
+        而那在 Tk 主线程上 —— 在这儿读串口 = 界面冻住等板子回话。
 
-        if info is not None:
+        三种情况必须分开说,因为用户要做的事完全不同:
+          读到了     -> 显示密码
+          404        -> 老固件没有 @AP,该升级(这才是"固件太老")
+          ＞其它     -> 没读到(超时/格式错),和固件新旧无关,该重试
+        绝不能把后两者都说成"请升级 v0.8.0+" —— 用户升完级还是连不上。
+        """
+        if info is not None and info.ok:
             pwd_line = "  密码:%s   (本机随机生成,已存在板子里)\n" % info.password
             step_line = "  1) 用电脑或手机的 WiFi 连上「%s」(密码 %s)\n" % (
                 info.ssid, info.password)
             extra = ""
-        else:
+        elif info is not None and info.missing_command:
             pwd_line = ("  密码:这一版固件不支持 @AP,读不到随机密码。\n"
                         "        请升级到 v0.8.0+,或看板子背面的标签。\n")
             step_line = "  1) 用电脑或手机的 WiFi 连上「%s」\n" % st.ssid
             extra = ("\n> 老固件(≤0.7.x)的 AP 密码是公开常量 12345678,\n"
                      "> 强烈建议升级到 v0.8.0 使用随机密码。\n")
+        else:
+            # 没读到 ≠ 固件太老。把真实原因说出来,别劝人做无用功。
+            reason = ("板子没回话(超时)" if (info is None or info.code == 408)
+                      else "读取出错(%d %s)" % (info.code, info.err))
+            pwd_line = ("  密码:这次没读到 —— %s\n"
+                        "        固件可能支持 @AP,只是这一条没通过。\n" % reason)
+            step_line = "  1) 用电脑或手机的 WiFi 连上「%s」\n" % st.ssid
+            extra = ("\n> 密码可能要重试一次才能读到(点「AP 密码」按钮),\n"
+                     "> 或者看板子背面的标签。\n")
 
         self._show_result(
             "当前:AP 模式(板子自己发热点)\n"
@@ -4048,7 +4337,10 @@ class App:
                st.ip, PORT_USBIP, st.ip, PORT_UART_BRIDGE, extra), "info")
 
     def _show_ap_password(self) -> None:
-        """读并显示当前 AP 热点密码(用户主动点才查,不放进例行刷新)。"""
+        """按钮:主动读一次并发显示 AP 热点密码。
+
+        走 submit 排队,I/O 在 worker 线程 —— 和例行刷新用同一条路径。
+        """
         if self.client is None:
             self._show_result("还没连上设备", "err")
             return
@@ -4059,12 +4351,21 @@ class App:
         if err is not None:
             self._show_result("读取失败:%s" % err, "err")
             return
-        info = result
-        if info is None:
-            self._show_result(
-                "这块板子的固件不支持 @AP(需要 v0.8.0+)。\n\n"
-                "老固件的 AP 密码是公开常量 12345678 —— 也就是说谁都能连上\n"
-                "它的热点。建议升级固件,用随机密码。", "warn")
+        info = result if isinstance(result, ApInfo) else None
+        if info is None or not info.ok:
+            if info is not None and info.missing_command:
+                self._show_result(
+                    "这块板子的固件不支持 @AP(需要 v0.8.0+)。\n\n"
+                    "老固件的 AP 密码是公开常量 12345678 —— 也就是说谁都能连上\n"
+                    "它的热点。建议升级固件,用随机密码。", "warn")
+            else:
+                # 没读到 ≠ 固件太老。把真实原因说出来,别劝人做无用功。
+                why = ("板子没回话(超时)" if info is None or info.code == 408
+                       else "读取出错(%d %s)" % (info.code, info.err))
+                self._show_result(
+                    "这次没读到 AP 密码:%s\n\n"
+                    "板子能正常应答别的命令的话,固件多半是支持 @AP 的,\n"
+                    "重试一次通常就好(再点一次「AP 密码」)。" % why, "err")
             return
         self._show_result(
             "当前 AP 热点\n"
@@ -4101,11 +4402,19 @@ class App:
         if err is not None:
             self._show_result("重新生成失败:%s" % err, "err")
             return
-        info = result
-        if info is None:
-            self._show_result(
-                "板子不支持 @AP REGEN。\n\n"
-                "这条命令是 v0.8.0 新增的,请升级固件后重试。", "err")
+        info = result if isinstance(result, ApInfo) else None
+        if info is None or not info.ok:
+            if info is not None and info.missing_command:
+                self._show_result(
+                    "板子不支持 @AP REGEN。\n\n"
+                    "这条命令是 v0.8.0 新增的,请升级固件后重试。", "err")
+            else:
+                why = ("板子没回话(超时)" if info is None or info.code == 408
+                       else "出错(%d %s)" % (info.code, info.err))
+                self._show_result(
+                    "这次没能换密码:%s\n\n"
+                    "**旧密码没有变**,板子上的密码仍是原来那个,可以放心。\n"
+                    "过几秒再点一次通常就好。" % why, "err")
             return
         self._log("AP 密码已重新生成:%s" % info.password, "ok")
         self._show_result(
@@ -4191,7 +4500,11 @@ class App:
             st = parse_status(reply.text) or Status(mode="AP", ip=AP_DEFAULT_IP,
                                                     ssid="?")
             self._apply_status(st)
-            self._show_ap_hint(st)
+            # 这里**不**直接排版 AP 面板:面板要显示密码,而密码得走一条
+            # 串口命令(@AP,超时 4s)。本函数在 Tk 主线程上跑,当场读就是
+            # 冻住界面。先给一句"正在读",把读密码的活交给紧随其后的
+            # _refresh_state(worker 线程),它读完会调 _show_ap_hint。
+            self._show_result("已切到 AP 模式,正在读取热点信息…", "info")
         else:
             self._show_result("已切到 STA 模式,板子开始按已保存网络逐个重连…", "info")
         self.submit("刷新状态", self._refresh_state, self._after_state)
