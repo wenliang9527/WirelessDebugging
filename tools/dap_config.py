@@ -2542,7 +2542,7 @@ def run_selftest() -> int:
 
         # --- 回归:串口 hwid 预筛 -------------------------------------
         check("DAP 的 VID:PID 能被识别",
-              _is_likely_dap_port("USB VID:PID=303A:1001 SER=AC:A7"),
+              _is_likely_dap_port("USB VID:PID=303A:1001 SER=00:11"),
               "")
         check("非 DAP 的串口不会被误判",
               not _is_likely_dap_port("USB VID:PID=1A86:55D3 SER=5C36"),
@@ -4258,7 +4258,7 @@ class App:
             "Reset 必须选 SYSRESETREQ(选 Autodetect 会报不支持)\n"
             "\n"
             "串口桥(给目标板串口)\n"
-            "TCP %s:%d,首包发波特率行,例如 19200E\n"
+            "TCP %s:%d,首包发波特率帧,例如 19200E(无空格无换行)\n"
             "\n"
             "链路自检:ping %s,再测端口 %d / %d。"
             % (ssid, ip, ip, ip, ip, ip, PORT_UART_BRIDGE, ip,
