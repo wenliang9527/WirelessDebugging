@@ -495,6 +495,13 @@ def run_selftest() -> int:
 
 
 def main() -> int:
+    # 中文输出在非 UTF-8 控制台(CI runner 是 cp1252)会 UnicodeEncodeError;
+    # 与 dap_config.main() 同一套保底,--selftest 的"跳过/通过"文案才能打印。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=os.path.join(HERE, "dist"))
     ap.add_argument("--skip-exe", action="store_true",
