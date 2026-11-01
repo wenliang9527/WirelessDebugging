@@ -59,6 +59,7 @@ class App:
     C_WARN      = "#a16207"
     C_WARN_BG   = "#fffbeb"
     C_INFO_BG   = "#f8fafc"
+    C_RAIL      = "#eef1f5"   # 侧栏底色(方案三)
 
     def __init__(self, port: Optional[str] = None, mock: bool = False):
         import tkinter as tk
@@ -78,20 +79,39 @@ class App:
         self._sort_col = "rssi"
         self._sort_desc = True
         self._busy = False
+        self._busy_label = ""
         self._closing = False
+        self._cmd_buttons: List[object] = []   # 所有会发串口命令的按钮
         self._log_lines = 0
         self._led_timer = None
+        self._led_suspend = False   # _apply_led_value 程序回填期间挂起防抖
         # 用户界面偏好(设备地址 / 两个 target)。文件缺失或损坏时是空 dict,
         # 界面各处用 .get(key, 默认值) 兜底 —— 见 load_settings() 的说明。
         self._settings = load_settings()
         # 已经写进磁盘的那份,用于"只在真的变了才写"
         self._settings_saved = dict(self._settings)
 
+        # DPI 感知(体检 P2-5):不开的话 tk 按 96 DPI 排版再被系统位图拉伸,
+        # 文字发虚;920x760 在 150% 缩放的 1080p 屏上物理高度超出屏幕,
+        # 状态栏直接看不见。必须在 Tk() 创建之前设置。
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Win 8.1+
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()     # Win 7 兜底
+                except Exception:
+                    pass
         self.root = tk.Tk()
         self.root.title("无线调试器 · 配网工具")
         self._base_title = self.root.title()
-        self.root.geometry("920x760")
-        self.root.minsize(820, 660)
+        try:
+            self._dscale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            self._dscale = 1.0
+        self.root.geometry("%dx%d" % (self._px(920), self._px(760)))
+        self.root.minsize(self._px(820), self._px(660))
         self.root.configure(bg=self.C_BG)
 
         # tk 变量必须在 Tk() 之后创建(否则 "no default root window")
@@ -111,9 +131,7 @@ class App:
             pass
         self._configure_style(mono, ui)
 
-        self._build_top()
-        self._build_tabs(mono, ui)
-        self._build_statusbar(ui)
+        self._build_shell()
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True,
                                         name="dap-worker")
@@ -134,6 +152,10 @@ class App:
             self.submit("探测设备", self._autodetect, self._after_autodetect)
 
     # --- 界面搭建 ----------------------------------------------------
+    def _px(self, n: float) -> int:
+        """像素尺寸按 DPI 缩放。字体走磅值会自己跟 DPI,像素值不会。"""
+        return max(1, int(round(n * getattr(self, "_dscale", 1.0))))
+
     def _pick_font(self) -> str:
         """等宽字体:表格与日志用。"""
         try:
@@ -206,6 +228,16 @@ class App:
                           ("disabled", "#eba3a3")],
               foreground=[("active", "#ffffff"), ("pressed", "#ffffff"),
                           ("disabled", "#fdf3f3")])
+        # 描边红:破坏性次级动作(删除/恢复出厂)。整块大红留给"正在发生的
+        # 错误";这类按钮要醒目,但不该和主操作抢视觉权重(体检 H 维)。
+        s.configure("DangerOutline.TButton", font=(ui, 10, "bold"),
+                    padding=(12, 6), background="#ffffff",
+                    foreground=self.C_ERR, borderwidth=1, relief="solid",
+                    bordercolor="#e3a1a1", focusthickness=0)
+        s.map("DangerOutline.TButton",
+              background=[("active", "#fef2f2"), ("disabled", "#f3f4f6")],
+              foreground=[("active", "#991b1b"), ("disabled", "#a8b0ba")],
+              bordercolor=[("active", "#dc2626"), ("disabled", "#e3e6ea")])
         # 次级动作(固定优先):白底蓝字蓝框,和 Primary 一个色系但分清主次
         s.configure("Secondary.TButton", font=(ui, 10, "bold"), padding=(12, 6),
                     background="#ffffff", foreground=self.C_PRIMARY_H,
@@ -216,7 +248,7 @@ class App:
               bordercolor=[("active", "#1e3fa8"), ("disabled", "#d8dde4")])
 
         # 表格
-        s.configure("Treeview", font=(mono, 10), rowheight=30,
+        s.configure("Treeview", font=(mono, 10), rowheight=self._px(30),
                     background=self.C_CARD, fieldbackground=self.C_CARD,
                     foreground=self.C_TEXT, borderwidth=0)
         s.map("Treeview",
@@ -271,53 +303,127 @@ class App:
         body.pack(fill="both", expand=True, padx=14, pady=(8, 12))
         return outer, body
 
-    def _build_top(self) -> None:
+    # --- 界面搭建(方案三:左侧导航栏 + 右侧主区)----------------------
+    # 页面栈用 grid + tkraise 切换,代替顶部 Notebook。理由:
+    #   1) 四个页名左对齐列出来,一眼扫完,不用认"第几个标签";
+    #   2) 调试接入页底部那句"不要同时开"的安全警告不再被窗口下边缘裁掉
+    #      (体检 P2-2:旧布局页内容超出可用高度且无滚动条,拉都拉不到)。
+    NAV_ITEMS = (("config", "配网"), ("saved", "已保存网络"),
+                 ("debug", "调试接入"), ("log", "日志"))
+
+    def _build_shell(self) -> None:
         tk, ttk = self._tk, self._ttk
-        wrap = tk.Frame(self.root, bg=self.C_BG)
-        wrap.pack(fill="x", padx=14, pady=(14, 0))
+        self._nav_rows = {}
+        shell = tk.Frame(self.root, bg=self.C_BG)
+        shell.pack(fill="both", expand=True)
 
-        card, body = self._card(wrap)
-        card.pack(fill="x")
+        # --- 左侧导航栏 ---
+        rail = tk.Frame(shell, bg=self.C_RAIL, width=self._px(172))
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        tk.Label(rail, text="无线调试器", bg=self.C_RAIL, fg=self.C_TEXT,
+                 font=(self._ui, 11, "bold"), anchor="w",
+                 padx=14, pady=6).pack(fill="x")
+        for key, text in self.NAV_ITEMS:
+            row = tk.Label(rail, text=text, bg=self.C_RAIL, fg=self.C_TEXT,
+                           font=(self._ui, 10), anchor="w", padx=14, pady=8,
+                           cursor="hand2")
+            row.pack(fill="x")
+            row.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+            self._nav_rows[key] = row
+        verbox = tk.Frame(rail, bg=self.C_RAIL)
+        verbox.pack(side="bottom", fill="x", padx=14, pady=8)
+        self.fw_var = tk.StringVar(value="—")
+        self.fw_label = tk.Label(verbox, textvariable=self.fw_var,
+                                 bg=self.C_RAIL, fg=self.C_TEXT_DIM,
+                                 font=(self._mono, 9), anchor="w")
+        self.fw_label.pack(fill="x")
+        tk.Label(verbox, text="v%s" % TOOL_VERSION, bg=self.C_RAIL,
+                 fg=self.C_TEXT_DIM, font=(self._ui, 9),
+                 anchor="w").pack(fill="x")
 
-        # --- 第一行:设备连接 ---
-        row1 = tk.Frame(body, bg=self.C_CARD)
+        # --- 右侧主区:设备行 + 状态条 + 页面栈 + 忙碌条 ---
+        main = tk.Frame(shell, bg=self.C_BG)
+        main.pack(side="left", fill="both", expand=True)
+        top = tk.Frame(main, bg=self.C_BG)
+        top.pack(fill="x", padx=self._px(14), pady=(self._px(12), 0))
+
+        row1 = tk.Frame(top, bg=self.C_BG)
         row1.pack(fill="x")
-
-        tk.Label(row1, text="设备", bg=self.C_CARD, fg=self.C_TEXT,
+        tk.Label(row1, text="设备", bg=self.C_BG, fg=self.C_TEXT,
                  font=(self._ui, 10, "bold")).pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(row1, textvariable=self.port_var, width=11,
-                                       state="readonly", font=(self._mono, 10))
+        self.port_combo = ttk.Combobox(row1, textvariable=self.port_var,
+                                       width=11, state="readonly",
+                                       font=(self._mono, 10))
         self.port_combo.pack(side="left", padx=(10, 6))
-        ttk.Button(row1, text="自动探测", width=10,
-                   command=lambda: self.submit("探测设备", self._autodetect,
-                                               self._after_autodetect)).pack(side="left")
-        ttk.Button(row1, text="连接", width=7,
-                   command=self._connect_selected).pack(side="left", padx=(6, 0))
-
-        # 右侧连接状态徽标
+        b_probe = ttk.Button(row1, text="自动探测", width=10,
+                             command=lambda: self.submit("探测设备", self._autodetect,
+                                                         self._after_autodetect))
+        b_probe.pack(side="left")
+        self._cmd_buttons.append(b_probe)
+        b_conn = ttk.Button(row1, text="连接", width=7,
+                            command=self._connect_selected)
+        b_conn.pack(side="left", padx=(6, 0))
+        self._cmd_buttons.append(b_conn)
         self.conn_badge = tk.Label(row1, text="  未连接  ", bg="#eceff3",
                                    fg=self.C_TEXT_DIM,
                                    font=(self._ui, 10, "bold"), padx=10, pady=4)
         self.conn_badge.pack(side="right")
         self.conn_label = self.conn_badge     # 兼容旧引用
 
-        # --- 第二行:状态摘要 ---
-        status_bar = tk.Frame(body, bg=self.C_INFO_BG)
-        status_bar.pack(fill="x", pady=(11, 0))
+        # 状态条:UI 字体(体检 P3-1 —— 中文走等宽字体的回退渲染发虚)
         self.top_status = tk.StringVar(value="正在探测串口…")
-        self.status_label = tk.Label(status_bar, textvariable=self.top_status,
+        self.status_label = tk.Label(top, textvariable=self.top_status,
                                      bg=self.C_INFO_BG, fg=self.C_TEXT,
-                                     font=(self._mono, 10), anchor="w",
+                                     font=(self._ui, 10), anchor="w",
                                      padx=10, pady=7)
-        self.status_label.pack(fill="x")
+        self.status_label.pack(fill="x", pady=(self._px(10), 0))
 
-        # --- 第三行:模式与固件 ---
+        self.page_stack = tk.Frame(main, bg=self.C_BG)
+        self.page_stack.pack(fill="both", expand=True,
+                             padx=self._px(14), pady=(self._px(10), 0))
+        self.page_stack.rowconfigure(0, weight=1)
+        self.page_stack.columnconfigure(0, weight=1)
+        self._pages = {}
+        for key, _text in self.NAV_ITEMS:
+            page = tk.Frame(self.page_stack, bg=self.C_BG)
+            page.grid(row=0, column=0, sticky="nsew")
+            self._pages[key] = page
+
+        self.busy_var = tk.StringVar(value="就绪")
+        tk.Label(main, textvariable=self.busy_var, bg=self.C_BG,
+                 fg=self.C_TEXT_DIM, font=(self._ui, 9), anchor="w").pack(
+            fill="x", padx=self._px(14), pady=(self._px(8), self._px(10)))
+
+        self._build_page_config(self._pages["config"])
+        self._build_page_saved(self._pages["saved"])
+        self._build_page_debug(self._pages["debug"])
+        self._build_page_log(self._pages["log"])
+        self._show_page("config")
+
+    def _show_page(self, key: str) -> None:
+        """切页面:导航项高亮 + tkraise。页面常驻内存,切换零开销。"""
+        for k, row in self._nav_rows.items():
+            active = (k == key)
+            row.configure(
+                bg=self.C_PRIMARY if active else self.C_RAIL,
+                fg="#ffffff" if active else self.C_TEXT,
+                font=(self._ui, 10, "bold") if active else (self._ui, 10))
+        self._pages[key].tkraise()
+
+    def _build_page_config(self, parent) -> None:
+        """配网页:设备控制卡(模式/指示灯)+ 扫描工具条 + 列表 + 结果面板。"""
+        tk, ttk = self._tk, self._ttk
+        mono, ui = self._mono, self._ui
+
+        # 模式与指示灯:从旧顶部卡第三行迁来,独占一卡不再七组控件挤一行
+        card, body = self._card(parent)
+        card.pack(fill="x")
         row3 = tk.Frame(body, bg=self.C_CARD)
-        row3.pack(fill="x", pady=(12, 0))
-
+        row3.pack(fill="x")
         tk.Label(row3, text="模式", bg=self.C_CARD, fg=self.C_TEXT,
-                 font=(self._ui, 10, "bold")).pack(side="left")
+                 font=(ui, 10, "bold")).pack(side="left")
         self.mode_btn_sta = ttk.Button(row3, text="切换 STA", width=10,
                                        style="Secondary.TButton",
                                        command=lambda: self._set_mode("STA"))
@@ -326,70 +432,78 @@ class App:
                                       style="Secondary.TButton",
                                       command=lambda: self._set_mode("AP"))
         self.mode_btn_ap.pack(side="left")
-        ttk.Button(row3, text="重启设备", width=9,
-                   command=self._reboot).pack(side="left", padx=(14, 0))
+        b_reboot = ttk.Button(row3, text="重启设备", width=9,
+                              command=self._reboot)
+        b_reboot.pack(side="left", padx=(14, 0))
+        self._cmd_buttons.append(b_reboot)
         # AP 密码是随机生成的、存在板子里 —— 用户必须有个地方能看到它,
         # 否则"连不上自家热点"就没救了。也提供重新生成(带确认)。
-        ttk.Button(row3, text="AP 密码", width=9,
-                   command=self._show_ap_password).pack(side="left", padx=(6, 0))
-        ttk.Button(row3, text="重新生成", width=9,
-                   command=self._regen_ap_password).pack(side="left", padx=(2, 0))
+        b_ap = ttk.Button(row3, text="AP 密码", width=9,
+                          command=self._show_ap_password)
+        b_ap.pack(side="left", padx=(6, 0))
+        self._cmd_buttons.append(b_ap)
+        b_regen = ttk.Button(row3, text="重新生成", width=9,
+                             command=self._regen_ap_password)
+        b_regen.pack(side="left", padx=(2, 0))
+        self._cmd_buttons.append(b_regen)
 
-        # 状态灯亮度:灯太刺眼是常见抱怨,给个滑块当场调,不用重烧固件
-        self.fw_var = tk.StringVar(value="—")
-        self.fw_label = tk.Label(row3, textvariable=self.fw_var, bg=self.C_CARD,
-                                 fg=self.C_TEXT_DIM, font=(self._mono, 9))
-        self.fw_label.pack(side="right")
-
-        led_box = tk.Frame(row3, bg=self.C_CARD)
-        led_box.pack(side="right", padx=(0, 18))
-        tk.Label(led_box, text="指示灯", bg=self.C_CARD, fg=self.C_TEXT,
-                 font=(self._ui, 10, "bold")).pack(side="left")
+        # 指示灯滑块:经典 tk.Scale —— clam 主题的 ttk.Scale 槽条和白卡
+        # 几乎同色,滑块等于隐形(体检 P2-4)。浅蓝槽 + 主色活动态,一眼可见。
+        ledrow = tk.Frame(body, bg=self.C_CARD)
+        ledrow.pack(fill="x", pady=(10, 0))
+        tk.Label(ledrow, text="指示灯", bg=self.C_CARD, fg=self.C_TEXT,
+                 font=(ui, 10, "bold")).pack(side="left")
         self.led_var = tk.IntVar(self.root, value=4)
-        self.led_scale = ttk.Scale(led_box, from_=1, to=20, orient="horizontal",
-                                   length=96, variable=self.led_var,
-                                   command=self._on_led_slide)
+        self.led_scale = tk.Scale(ledrow, from_=1, to=20, orient="horizontal",
+                                  showvalue=False, length=self._px(130),
+                                  variable=self.led_var,
+                                  command=self._on_led_slide,
+                                  troughcolor="#dbeafe", bg=self.C_CARD,
+                                  fg=self.C_TEXT,
+                                  activebackground=self.C_PRIMARY,
+                                  highlightthickness=0, borderwidth=0,
+                                  sliderlength=self._px(16))
         self.led_scale.pack(side="left", padx=(8, 6))
         self.led_pct_var = tk.StringVar(value="4%")
-        tk.Label(led_box, textvariable=self.led_pct_var, bg=self.C_CARD,
-                 fg=self.C_TEXT_DIM, font=(self._mono, 9), width=4,
+        tk.Label(ledrow, textvariable=self.led_pct_var, bg=self.C_CARD,
+                 fg=self.C_TEXT_DIM, font=(mono, 9), width=4,
                  anchor="w").pack(side="left")
+        tk.Label(ledrow, text="灯太刺眼可当场调低,不用重烧固件",
+                 bg=self.C_CARD, fg=self.C_TEXT_DIM,
+                 font=(ui, 9)).pack(side="left", padx=(8, 0))
 
-    def _build_tabs(self, mono: str, ui: str) -> None:
-        tk, ttk = self._tk, self._ttk
-        holder = tk.Frame(self.root, bg=self.C_BG)
-        holder.pack(fill="both", expand=True, padx=14, pady=(12, 0))
-        self.nb = ttk.Notebook(holder)
-        self.nb.pack(fill="both", expand=True)
-
-        # ---- 配网页 ----
-        tab1 = tk.Frame(self.nb, bg=self.C_CARD)
-        self.nb.add(tab1, text="配网")
-
-        bar = tk.Frame(tab1, bg=self.C_CARD)
-        bar.pack(fill="x", padx=14, pady=(14, 10))
-        ttk.Button(bar, text="扫描 WiFi", style="Primary.TButton",
-                   command=self._do_scan).pack(side="left")
-        tk.Label(bar, text="密码", bg=self.C_CARD, fg=self.C_TEXT,
-                 font=(ui, 10)).pack(side="left", padx=(18, 8))
+        # --- 扫描工具条:左"扫描/刷新",右"密码组 + 连接" ---
+        bar = tk.Frame(parent, bg=self.C_BG)
+        bar.pack(fill="x", pady=(self._px(10), self._px(8)))
+        b_scan = ttk.Button(bar, text="扫描 WiFi", style="Primary.TButton",
+                            command=self._do_scan)
+        b_scan.pack(side="left")
+        self._cmd_buttons.append(b_scan)
+        b_rescan = ttk.Button(bar, text="刷新列表", command=self._do_scan)
+        b_rescan.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_rescan)
+        self.connect_btn = ttk.Button(bar, text="连接选中",
+                                      style="Primary.TButton",
+                                      command=self._do_connect)
+        self.connect_btn.pack(side="right")
+        self._cmd_buttons.append(self.connect_btn)
+        self.show_pass = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="显示", variable=self.show_pass,
+                        command=self._toggle_pass).pack(side="right",
+                                                        padx=(0, 8))
         self.pass_var = tk.StringVar()
         self.pass_entry = ttk.Entry(bar, textvariable=self.pass_var, show="*",
                                     width=22, font=(mono, 10))
-        self.pass_entry.pack(side="left")
+        self.pass_entry.pack(side="right")
         self.pass_entry.bind("<Return>", lambda e: self._do_connect())
-        self.show_pass = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="显示", variable=self.show_pass,
-                        command=self._toggle_pass).pack(side="left", padx=(8, 0))
-        self.connect_btn = ttk.Button(bar, text="连接选中", style="Primary.TButton",
-                                      command=self._do_connect)
-        self.connect_btn.pack(side="left", padx=(16, 0))
-        ttk.Button(bar, text="刷新列表", command=self._do_scan).pack(side="right")
+        tk.Label(bar, text="密码", bg=self.C_BG, fg=self.C_TEXT,
+                 font=(ui, 10)).pack(side="right", padx=(0, 8))
 
         cols = ("ssid", "bar", "rssi", "auth", "ch")
-        tree_wrap = tk.Frame(tab1, bg=self.C_CARD)
+        tree_wrap = tk.Frame(parent, bg=self.C_BG)
         # 表格按内容高度(最多 8 行)取空间,剩下的都给下面的结果面板 ——
         # 扫描结果通常不到 10 行,而"下一步怎么调试"那段说明有 20 行。
-        tree_wrap.pack(fill="x", padx=14)
+        tree_wrap.pack(fill="x")
         self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
                                  selectmode="browse", height=7)
         heads = (("ssid", "WiFi 名称", 300, "w"), ("bar", "信号", 90, "center"),
@@ -398,7 +512,7 @@ class App:
         for key, text, width, anchor in heads:
             self.tree.heading(key, text=text,
                               command=lambda k=key: self._sort_by(k))
-            self.tree.column(key, width=width, anchor=anchor,
+            self.tree.column(key, width=self._px(width), anchor=anchor,
                              stretch=(key == "ssid"))
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -410,16 +524,20 @@ class App:
         self.tree.tag_configure("odd", background="#f6f8fb")
 
         # 结果面板
-        res_head = tk.Frame(tab1, bg=self.C_CARD)
-        res_head.pack(fill="x", padx=14, pady=(14, 6))
-        tk.Label(res_head, text="提示与结果", bg=self.C_CARD, fg=self.C_TEXT,
+        res_head = tk.Frame(parent, bg=self.C_BG)
+        res_head.pack(fill="x", pady=(self._px(10), self._px(6)))
+        tk.Label(res_head, text="提示与结果", bg=self.C_BG, fg=self.C_TEXT,
                  font=(ui, 10, "bold")).pack(side="left")
-        self.res_hint = tk.Label(res_head, text="", bg=self.C_CARD,
+        self.res_hint = tk.Label(res_head, text="", bg=self.C_BG,
                                  fg=self.C_TEXT_DIM, font=(ui, 9))
         self.res_hint.pack(side="right")
+        # 「下一步怎么做」给的就是要复制去用的命令,却没有复制按钮 —— 补一个
+        # (体检 P3-6;求助场景同样受益)。
+        ttk.Button(res_head, text="复制", width=6,
+                   command=self._copy_result).pack(side="right", padx=(0, 10))
 
-        res_holder = tk.Frame(tab1, bg=self.C_BORDER)
-        res_holder.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        res_holder = tk.Frame(parent, bg=self.C_BORDER)
+        res_holder.pack(fill="both", expand=True)
         self.result = tk.Text(res_holder, height=8, wrap="word", relief="flat",
                               borderwidth=0, font=(mono, 10), padx=14, pady=12,
                               state="disabled", cursor="arrow",
@@ -442,29 +560,38 @@ class App:
                                   foreground=self.C_PRIMARY,
                                   lmargin1=18, lmargin2=18)
 
-        # ---- 已保存网络 ----
-        tab2 = tk.Frame(self.nb, bg=self.C_CARD)
-        self.nb.add(tab2, text="已保存网络")
+    def _build_page_saved(self, parent) -> None:
+        """已保存网络页:置顶/固定/删除 + 统计;恢复出厂收在右下角。"""
+        tk, ttk = self._tk, self._ttk
+        ui = self._ui
 
-        bar2 = tk.Frame(tab2, bg=self.C_CARD)
-        bar2.pack(fill="x", padx=14, pady=(14, 10))
-        ttk.Button(bar2, text="刷新", command=self._do_list).pack(side="left")
-        ttk.Button(bar2, text="置顶选中", style="Primary.TButton",
-                   command=self._do_prioritize).pack(side="left", padx=(8, 0))
+        bar2 = tk.Frame(parent, bg=self.C_BG)
+        bar2.pack(fill="x", pady=(0, self._px(8)))
+        b_prio = ttk.Button(bar2, text="置顶选中", style="Primary.TButton",
+                            command=self._do_prioritize)
+        b_prio.pack(side="left")
+        self._cmd_buttons.append(b_prio)
         self.pin_btn = ttk.Button(bar2, text="固定优先", style="Secondary.TButton",
                                   width=10, command=self._do_toggle_pin)
         self.pin_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(bar2, text="删除选中", style="Danger.TButton",
-                   command=self._do_delete).pack(side="left", padx=(8, 0))
-        ttk.Button(bar2, text="恢复出厂设置", style="Danger.TButton",
-                   command=self._do_factory).pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(self.pin_btn)
+        b_del = ttk.Button(bar2, text="删除选中", style="DangerOutline.TButton",
+                           command=self._do_delete)
+        b_del.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_del)
+        b_list = ttk.Button(bar2, text="刷新", command=self._do_list)
+        b_list.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_list)
+        # 统计独立成行右对齐:和按钮挤同一行的话,窄页宽下文字会被裁
+        # (方案三目检发现;来源说明较长,一行放不下)
         self.src_var = tk.StringVar(value="")
-        tk.Label(bar2, textvariable=self.src_var, bg=self.C_CARD,
-                 fg=self.C_TEXT_DIM, font=(ui, 9)).pack(side="right")
+        tk.Label(parent, textvariable=self.src_var, bg=self.C_BG,
+                 fg=self.C_TEXT_DIM, font=(ui, 9), anchor="e").pack(
+            fill="x", pady=(0, self._px(4)))
 
         cols2 = ("idx", "pin", "ssid", "pass")
-        save_wrap = tk.Frame(tab2, bg=self.C_CARD)
-        save_wrap.pack(fill="both", expand=True, padx=14)
+        save_wrap = tk.Frame(parent, bg=self.C_BG)
+        save_wrap.pack(fill="both", expand=True)
         self.save_tree = ttk.Treeview(save_wrap, columns=cols2, show="headings",
                                       height=10)
         for key, text, width, anchor in (("idx", "#", 50, "center"),
@@ -474,7 +601,8 @@ class App:
             self.save_tree.heading(key, text=text)
             # pin 列不许 stretch:📌(宽)和空串(窄)渲染宽度不同,
             # 列宽跟着内容抖会让整张表横向跳
-            self.save_tree.column(key, width=width, minwidth=width,
+            self.save_tree.column(key, width=self._px(width),
+                                  minwidth=self._px(width),
                                   anchor=anchor, stretch=(key == "ssid"))
         vsb2 = ttk.Scrollbar(save_wrap, orient="vertical",
                              command=self.save_tree.yview)
@@ -492,19 +620,26 @@ class App:
                 "「连接」新网络成功后,那条会成为最近使用的(未 pin 时即主网)。\n"
                 "「恢复出厂设置」清空全部已存网络并回到未配网状态,"
                 "需要重新插 USB 配网。")
-        tk.Label(tab2, text=note, bg=self.C_CARD, fg=self.C_TEXT_DIM,
+        bottom = tk.Frame(parent, bg=self.C_BG)
+        bottom.pack(fill="x", pady=(self._px(8), 0))
+        # 全窗最具破坏性的动作:描边红 + 收在右下,不和普通删除并排同权重
+        # (体检 H 维;确认框之前的 busy 闸门见 _do_factory)
+        b_factory = ttk.Button(bottom, text="恢复出厂设置",
+                               style="DangerOutline.TButton",
+                               command=self._do_factory)
+        b_factory.pack(side="right", padx=(10, 0))
+        self._cmd_buttons.append(b_factory)
+        tk.Label(bottom, text=note, bg=self.C_BG, fg=self.C_TEXT_DIM,
                  font=(ui, 9), justify="left",
-                 anchor="w").pack(fill="x", padx=14, pady=(10, 14))
+                 anchor="w").pack(side="left", fill="x", expand=True)
 
-        # ---- 调试接入 ----
-        self._build_debug_tab(ttk, ui, mono)
+    def _build_page_log(self, parent) -> None:
+        """日志页:黑底彩色日志 + 手动命令。"""
+        tk, ttk = self._tk, self._ttk
+        mono, ui = self._mono, self._ui
 
-        # ---- 日志 ----
-        tab3 = tk.Frame(self.nb, bg=self.C_CARD)
-        self.nb.add(tab3, text="日志")
-
-        bar3 = tk.Frame(tab3, bg=self.C_CARD)
-        bar3.pack(fill="x", padx=14, pady=(14, 10))
+        bar3 = tk.Frame(parent, bg=self.C_BG)
+        bar3.pack(fill="x", pady=(0, self._px(8)))
         ttk.Checkbutton(bar3, text="板端日志", variable=self.show_board_log
                         ).pack(side="left")
         ttk.Checkbutton(bar3, text="协议帧", variable=self.show_frames
@@ -515,19 +650,8 @@ class App:
                    command=self._copy_log).pack(side="right", padx=(0, 8))
         ttk.Button(bar3, text="清空", command=self._clear_log).pack(side="right")
 
-        cmdbar = tk.Frame(tab3, bg=self.C_CARD)
-        cmdbar.pack(side="bottom", fill="x", padx=14, pady=(10, 14))
-        tk.Label(cmdbar, text="手动命令", bg=self.C_CARD, fg=self.C_TEXT,
-                 font=(ui, 10)).pack(side="left")
-        self.cmd_var = tk.StringVar()
-        e = ttk.Entry(cmdbar, textvariable=self.cmd_var, font=(mono, 10))
-        e.pack(side="left", fill="x", expand=True, padx=(10, 8))
-        e.bind("<Return>", lambda ev: self._send_manual())
-        ttk.Button(cmdbar, text="发送", style="Primary.TButton",
-                   command=self._send_manual).pack(side="right")
-
-        log_holder = tk.Frame(tab3, bg=self.C_BORDER)
-        log_holder.pack(fill="both", expand=True, padx=14)
+        log_holder = tk.Frame(parent, bg=self.C_BORDER)
+        log_holder.pack(fill="both", expand=True)
         self.log = tk.Text(log_holder, wrap="none", font=(mono, 9),
                            state="disabled", relief="flat", borderwidth=0,
                            background="#0f1419", foreground="#c9d1d9",
@@ -541,21 +665,32 @@ class App:
         self.log.tag_configure("openocd", foreground="#a5d6ff")
         self.log.tag_configure("sys", foreground="#e3b341")
 
-    def _build_debug_tab(self, ttk, ui: str, mono: str) -> None:
+        cmdbar = tk.Frame(parent, bg=self.C_BG)
+        cmdbar.pack(fill="x", pady=(self._px(8), 0))
+        tk.Label(cmdbar, text="手动命令", bg=self.C_BG, fg=self.C_TEXT,
+                 font=(ui, 10)).pack(side="left")
+        self.cmd_var = tk.StringVar()
+        e = ttk.Entry(cmdbar, textvariable=self.cmd_var, font=(mono, 10))
+        e.pack(side="left", fill="x", expand=True, padx=(10, 8))
+        e.bind("<Return>", lambda ev: self._send_manual())
+        ttk.Button(cmdbar, text="发送", style="Primary.TButton",
+                   command=self._send_manual).pack(side="right")
+
+    def _build_page_debug(self, parent) -> None:
         """调试接入页:三条路各自一个开关。
 
         为什么做成三个独立开关而不是"一键全开":usbip 和 Keil/OpenOCD 会抢
         同一个 DAP 会话(固件只支持单连接)。一键全开必然打架,而让用户
         自己选反而清晰 —— 页底那行红字就是在说这件事。
         """
-        tk = self._tk
-        tab = tk.Frame(self.nb, bg=self.C_CARD)
-        self.nb.add(tab, text="调试接入")
+        tk, ttk = self._tk, self._ttk
+        ui, mono = self._ui, self._mono
+        tab = parent
 
         # 顶部:当前设备地址(决定三个后端都连哪)
-        bar = tk.Frame(tab, bg=self.C_CARD)
-        bar.pack(fill="x", padx=14, pady=(14, 8))
-        tk.Label(bar, text="设备地址", bg=self.C_CARD, fg=self.C_TEXT,
+        bar = tk.Frame(tab, bg=self.C_BG)
+        bar.pack(fill="x", pady=(0, 6))
+        tk.Label(bar, text="设备地址", bg=self.C_BG, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
         # 启动时的默认值来自 settings.json(用户上次填的),没有才用 dap.local
         self.addr_var = tk.StringVar(
@@ -564,7 +699,7 @@ class App:
         e.pack(side="left", padx=(10, 6))
         e.bind("<Return>", lambda ev: self._apply_addr())
         ttk.Button(bar, text="应用", command=self._apply_addr).pack(side="left")
-        tk.Label(bar, text="(mDNS 名,IP 变了也不用改)", bg=self.C_CARD,
+        tk.Label(bar, text="(mDNS 名,IP 变了也不用改)", bg=self.C_BG,
                  fg=self.C_TEXT_DIM, font=(ui, 9)).pack(side="left", padx=(10, 0))
         # 恢复默认 + 显示设置文件位置:用户得知道工具往哪儿写了东西
         ttk.Button(bar, text="恢复默认", width=9,
@@ -575,7 +710,8 @@ class App:
         self._backend_rows = {}
         # usbip 状态缓存:驱动装没装(进程内缓存一次)、可达性(5s TTL),
         # 避免每次刷新都在 UI 线程跑 pnputil / DNS 超时把界面卡住。
-        self._usbip_driver_state = None      # Optional[bool]
+        self._usbip_driver_state = None      # Optional[bool];None=还没检测到
+        self._usbip_driver_checking = False  # 后台检测中(pnputil 不进 UI 线程)
         self._usbip_reach_result = None      # Optional[(ok, msg, ts)]
         self._usbip_attached_state = None    # Optional[bool]
         self._usbip_attached_ts = 0.0
@@ -588,7 +724,7 @@ class App:
                 ("at32", "AT32 烧录", "atopenocd(雅特力 fork)· 必须先完成上面的 USB 桥接"),
         ):
             card, body = self._card(tab, title, sub)
-            card.pack(fill="x", padx=14, pady=(0, 8))
+            card.pack(fill="x", pady=(0, 6))
             row = tk.Frame(body, bg=self.C_CARD)
             row.pack(fill="x")
 
@@ -613,9 +749,9 @@ class App:
                     side="right", padx=(0, 8))
 
         # OpenOCD 的 target 选择 —— 没有这个选项的话,用户不知道该连什么芯片
-        trow = tk.Frame(tab, bg=self.C_CARD)
-        trow.pack(fill="x", padx=14, pady=(0, 8))
-        tk.Label(trow, text="OpenOCD 目标芯片", bg=self.C_CARD, fg=self.C_TEXT,
+        trow = tk.Frame(tab, bg=self.C_BG)
+        trow.pack(fill="x", pady=(0, 6))
+        tk.Label(trow, text="OpenOCD 目标芯片", bg=self.C_BG, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
         self.target_var = tk.StringVar(
             value=self._settings.get("target", DEFAULT_SETTINGS["target"]))
@@ -629,9 +765,9 @@ class App:
                  font=(ui, 9)).pack(side="left", padx=(6, 0))
 
         # AT32 的 target 选择(用 atopenocd 的 scripts,和上面那套不通用)
-        arow = tk.Frame(tab, bg=self.C_CARD)
-        arow.pack(fill="x", padx=14, pady=(0, 8))
-        tk.Label(arow, text="AT32 目标芯片", bg=self.C_CARD, fg=self.C_TEXT,
+        arow = tk.Frame(tab, bg=self.C_BG)
+        arow.pack(fill="x", pady=(0, 6))
+        tk.Label(arow, text="AT32 目标芯片", bg=self.C_BG, fg=self.C_TEXT,
                  font=(ui, 10)).pack(side="left")
         self.at32_var = tk.StringVar(
             value=self._settings.get("at32_target", DEFAULT_SETTINGS["at32_target"]))
@@ -644,9 +780,9 @@ class App:
                  bg=self.C_CARD, fg=self.C_TEXT_DIM,
                  font=(ui, 9)).pack(side="left", padx=(6, 0))
 
-        # 底部警告
+        # 底部警告:方案三布局里这行永远在可视区内(体检 P2-2)
         warn = tk.Frame(tab, bg=self.C_WARN_BG)
-        warn.pack(fill="x", padx=14, pady=(4, 14))
+        warn.pack(fill="x", pady=(6, 0))
         tk.Label(warn,
                  text="注意:usbip 与 Keil/OpenOCD 抢同一个 DAP 连接,不要同时开。\n"
                       "切换之前先把另一个关掉,否则表现为「连上了但没反应」。",
@@ -669,22 +805,36 @@ class App:
         self._log("重新检测 usbip 驱动与设备状态…", "sys")
         self._refresh_backends()
 
-    def _usbip_driver_cached(self, ub, force: bool = False) -> bool:
-        """驱动装没装 —— 缓存结果(pnputil 每次 250-300ms)。
+    def _usbip_driver_cached(self, ub, force: bool = False):
+        """驱动装没装 —— 只回缓存,pnputil 一律后台跑(体检 P2-3)。
 
-        缓存必须有失效手段:用户正是在这个界面上被提示"去装驱动",装完
-        回来了必须能立刻看到变化。原实现"进程内只查一次"会让用户装完
-        驱动后仍被拦在"驱动未装",只能重启工具 —— 所以这里给 force,
-        由「USB 桥接」卡片上的「重新检测」按钮触发。
+        pnputil 常态 250-300ms、subprocess timeout 是 20s:放在 UI 线程,
+        首帧和每次「重新检测」都会卡一下,最坏把界面冻住 20 秒。同文件里
+        reachable()/attached() 都已经后台化,这里是最后一个漏网的。
+
+        返回 None = 还在检测(调用方显示"正在检测",按钮先禁用);
+        force 由「重新检测」按钮触发,作废缓存让 _refresh_backends 重查。
         """
         if force:
             self._usbip_driver_state = None
-        if self._usbip_driver_state is None:
-            try:
-                self._usbip_driver_state = bool(ub.driver_installed())
-            except Exception:
-                self._usbip_driver_state = False
+        if self._usbip_driver_state is None and not self._usbip_driver_checking:
+            self._usbip_driver_checking = True
+
+            def work():
+                try:
+                    state = bool(ub.driver_installed())
+                except Exception:
+                    state = False
+                self.events.put(("usbip_driver", state))
+
+            threading.Thread(target=work, daemon=True,
+                             name="usbip-driver").start()
         return self._usbip_driver_state
+
+    def _on_usbip_driver(self, state: bool) -> None:
+        self._usbip_driver_checking = False
+        self._usbip_driver_state = bool(state)
+        self._refresh_backends()
 
     def _usbip_reach_cached(self):
         """可达性缓存,5s TTL。返回 (ok, msg) 或 None(需要新探测)。"""
@@ -811,7 +961,10 @@ class App:
             #   驱动状态按进程缓存一次(装没装不会变),
             #   可达性 5s TTL 缓存 + 后台线程探测(先显示上一次结果)。
             inst = self._usbip_driver_cached(ub)
-            if not inst:
+            if inst is None:
+                row["state"].configure(text="正在检测驱动…", fg=self.C_TEXT_DIM)
+                row["btn"].configure(text="挂载", state="disabled")
+            elif not inst:
                 row["state"].configure(
                     text="驱动未装,首次需运行 install_driver.bat", fg=self.C_WARN)
                 row["btn"].configure(text="挂载", state="normal")
@@ -1048,7 +1201,12 @@ class App:
             else:
                 # 烧 AT32 的前提是设备已经挂成本地 USB。没挂就直接起,
                 # OpenOCD 会报"no adapter found",用户看不出是桥接没做。
-                if not self._usbip_driver_cached(bm.usbip):
+                drv = self._usbip_driver_cached(bm.usbip)
+                if drv is None:
+                    self._show_result(
+                        "正在检测 usbip 驱动状态,几秒后再点「启动」。", "info")
+                    return
+                if not drv:
                     self._show_result(
                         "还没装 usbip 驱动。AT32 烧录的顺序是:\n\n"
                         "  1. 装 usbip 驱动(上面的 USB 桥接卡片)\n"
@@ -1074,7 +1232,11 @@ class App:
         if key == "usbip":
             # usbip 是「一次动作」:没挂就挂,已挂就卸 —— 按钮文案跟着状态走
             # (见 _refresh_backends 里的 attached 判断)。
-            if not self._usbip_driver_cached(bm.usbip):
+            drv = self._usbip_driver_cached(bm.usbip)
+            if drv is None:
+                self._show_result("正在检测 usbip 驱动状态,几秒后再点「挂载」。", "info")
+                return
+            if not drv:
                 ok = self._messagebox.askyesno(
                     "需要先装驱动",
                     "usbip 的 vhci 驱动还没装。\n\n"
@@ -1192,26 +1354,21 @@ class App:
         self._refresh_backends()
         self.root.after(2000, lambda: self._poll_openocd_ready(tries + 1, key))
 
-    def _build_statusbar(self, ui: str) -> None:
-        tk, ttk = self._tk, self._ttk
-        bar = tk.Frame(self.root, bg=self.C_BG)
-        bar.pack(fill="x", padx=14, pady=(10, 12))
-        self.busy_var = tk.StringVar(value="就绪")
-        self.busy_label = tk.Label(bar, textvariable=self.busy_var, bg=self.C_BG,
-                                   fg=self.C_TEXT_DIM, font=(ui, 9))
-        self.busy_label.pack(side="left")
-        tk.Label(bar, text="v%s" % TOOL_VERSION, bg=self.C_BG,
-                 fg=self.C_TEXT_DIM, font=(ui, 9)).pack(side="right")
-
     # --- 线程与事件 --------------------------------------------------
     def submit(self, label: str, fn: Callable[[], object],
                done: Optional[Callable[[object, Optional[BaseException]], None]] = None
                ) -> None:
         """把一件事排到工作线程。协议是串行的,所以所有 I/O 都走这一条队列。"""
         if self._busy:
+            # 只写日志的话用户无感(尤其刚在确认框里点了「确定」的),体检 P2-1:
+            # 必须在结果面板给一句,不然就是"确认了却什么都没发生"。
+            self._show_result(
+                "上一步还没完成(%s),等它结束后再点「%s」。"
+                % (getattr(self, "_busy_label", "") or "…", label), "warn")
             self._log("上一步还没完成,先等一下(%s)" % label, "sys")
             return
         self._busy = True
+        self._busy_label = label
         self.busy_var.set("%s …" % label)
         self._set_buttons(False)
         self.jobs.put((label, fn, done))
@@ -1242,6 +1399,11 @@ class App:
                     self._append_log(text, tag)
                 elif kind == "disconnect":
                     self._on_serial_disconnect(payload)
+                elif kind == "usbip_driver":
+                    try:
+                        self._on_usbip_driver(payload)
+                    except Exception as exc:
+                        self._log("usbip 驱动检测回调异常: %r" % (exc,), "err")
                 elif kind == "usbip_probe":
                     ok, msg = payload
                     try:
@@ -1256,6 +1418,7 @@ class App:
                 elif kind == "job_done":
                     label, result, err, done = payload
                     self._busy = False
+                    self._busy_label = ""
                     self._set_buttons(True)
                     self.busy_var.set("就绪")
                     if done is not None:
@@ -1277,7 +1440,10 @@ class App:
 
     def _set_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for btn in (self.mode_btn_sta, self.mode_btn_ap, self.connect_btn):
+        # 禁用面 = 所有会发串口命令的按钮(_build_* 时注册进 _cmd_buttons)。
+        # 只禁三个的话,busy 期间用户还能点「恢复出厂设置」然后被 submit
+        # 静默吞掉 —— 禁用面必须与"会发命令"的面一致(体检 P2-1)。
+        for btn in getattr(self, "_cmd_buttons", ()):
             try:
                 btn.configure(state=state)
             except Exception:
@@ -1366,6 +1532,11 @@ class App:
     def _on_serial_disconnect(self, reason: str) -> None:
         self._set_conn("lost")
         self._log("串口断开: %s" % reason, "err")
+        # 断开就把 client 收掉(体检 P3-4):否则它还挂着 is_open=True 的死句柄,
+        # 后续操作要等 write 超时才暴露;收掉后 _require_client 给出明确指引。
+        self._close_client()
+        self._show_result("串口已断开(%s)。\n\n点上方「自动探测」重新连接。" % reason,
+                          "warn")
 
     def _close_client(self) -> None:
         if self.client is not None:
@@ -1584,7 +1755,9 @@ class App:
                if net.auth.upper() == "OPEN"
                else "在右边「密码」框里填 WiFi 密码,然后点「连接选中」(或直接按回车)。"),
             "info")
-        if net.auth.upper() != "OPEN":
+        # 只在密码框还空着时才把焦点递过去(体检 P3-5):用户正用方向键
+        # 浏览列表时,无条件抢焦点会打断键盘流。
+        if net.auth.upper() != "OPEN" and not self.pass_var.get():
             self.pass_entry.focus_set()
 
     def _toggle_pass(self) -> None:
@@ -1782,6 +1955,10 @@ class App:
         if self.client is None:
             self._show_result("还没连上设备", "err")
             return
+        if self._busy:
+            self._show_result("上一步还没完成(%s),等它结束后再重新生成。"
+                              % (getattr(self, "_busy_label", "") or "…"), "warn")
+            return
         if not self._messagebox.askyesno(
                 "重新生成 AP 密码",
                 "确定要换一个新的热点密码吗?\n\n"
@@ -1833,18 +2010,32 @@ class App:
         if pct is None or not (1 <= pct <= 100):
             return
         try:
-            # 滑块量程只到 20,超出的部分夹到上限显示
-            self.led_var.set(min(pct, 20))
-            self.led_pct_var.set("%d%%" % pct)
+            # 滑块量程只到 20,超出的部分夹到上限显示。
+            # tk.Scale 的 command 在程序赋值时同样触发;挂起标志保证这次
+            # 回填不会走防抖下发(否则每次状态刷新都会多发一条 @LED)。
+            self._led_suspend = True
+            try:
+                self.led_var.set(min(pct, 20))
+                self.led_pct_var.set("%d%%" % pct)
+            finally:
+                self._led_suspend = False
+            if self._led_timer is not None:
+                try:
+                    self.root.after_cancel(self._led_timer)
+                except Exception:
+                    pass
+                self._led_timer = None
         except Exception:
             pass
 
     def _on_led_slide(self, _value=None) -> None:
         """滑块拖动时只更新数字,松手才发命令。
 
-        ttk.Scale 没有"松手"事件,用 after() 做一个 350ms 的防抖:
+        tk.Scale 也没有"松手"事件,用 after() 做一个 350ms 的防抖:
         拖动过程中不断重置计时器,停下后才真正下发。
         """
+        if getattr(self, "_led_suspend", False):
+            return   # _apply_led_value 的程序回填,不是用户拖动
         pct = int(round(self.led_var.get()))
         self.led_pct_var.set("%d%%" % pct)
         if self._led_timer is not None:
@@ -2025,6 +2216,10 @@ class App:
             return
         vals = self.save_tree.item(sel[0], "values")
         idx, ssid = int(vals[0]), vals[2]
+        if self._busy:
+            self._show_result("上一步还没完成(%s),等它结束后再删。"
+                              % (getattr(self, "_busy_label", "") or "…"), "warn")
+            return
         ok = self._messagebox.askyesno(
             "确认删除", "从板子的已保存网络里删掉这条?\n\n#%d  %s" % (idx, ssid))
         if not ok:
@@ -2083,6 +2278,12 @@ class App:
         self.submit("刷新", self._list_worker, lambda r, e: self._after_list(r, e))
 
     def _do_factory(self) -> None:
+        # 闸门必须在确认框之前(体检 P2-1):确认完再被 submit 静默吞掉,
+        # 比不确认更糟 —— 用户会以为恢复成功了。
+        if self._busy:
+            self._show_result("上一步还没完成(%s),等它结束后再点「恢复出厂设置」。"
+                              % (getattr(self, "_busy_label", "") or "…"), "warn")
+            return
         if not self._require_client():
             return
         ok = self._messagebox.askyesno(
@@ -2152,6 +2353,15 @@ class App:
         self._show_result("日志已复制(%d 行),直接粘贴发给对方。"
                           % text.count("\n"), "ok")
 
+    def _copy_result(self) -> None:
+        """复制结果面板全文(「下一步怎么做」里的命令就是要拿去用的)。"""
+        text = self.result.get("1.0", "end").rstrip()
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._log("结果面板已复制(%d 行)" % text.count("\n"), "sys")
+
     def _send_manual(self) -> None:
         line = self.cmd_var.get().strip()
         if not line:
@@ -2162,7 +2372,10 @@ class App:
         if not self._require_client():
             return
         self._append_log(">>> %s" % line, "proto")
-        self.submit("发送命令", lambda: self.client.request(line, TIMEOUT_CONNECT),
+        # 超时按命令分流(体检 P3-3):@CONNECT 板上最多等 25s,其余 5s 足够 ——
+        # 一刀切 32s 的话,板子不回话时 busy 要挂满 32 秒。
+        to = TIMEOUT_CONNECT if line.upper().startswith("@CONNECT") else TIMEOUT_DEFAULT
+        self.submit("发送命令", lambda: self.client.request(line, to),
                     self._after_manual)
 
     def _after_manual(self, reply, err) -> None:
@@ -2210,7 +2423,7 @@ class App:
             self._show_result(
                 "还没连上设备。\n\n"
                 "1) 把 USB 线插在板子上标 USB 的 native 口(不是 CH343 那个)\n"
-                "2) 点左上角「刷新」\n\n"
+                "2) 点上方「自动探测」重新连接\n\n"
                 "如果「刷新」后串口列表里有端口但探测不到,可能是这个口被别的程序占着"
                 "(串口助手、烧录工具、另一个本工具窗口)。", "warn")
             return False

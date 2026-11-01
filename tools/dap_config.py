@@ -63,9 +63,6 @@ def run_list() -> int:
     print("\n逐个发 @PING 探测(每个最多 1.5 秒)…")
     found = []
 
-    def progress(device: str, desc: str) -> None:
-        print("  探测 %-8s …" % device, end="", flush=True)
-
     for device, desc in ports:
         info = probe_port(device)
         if info:

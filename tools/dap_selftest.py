@@ -1294,6 +1294,183 @@ def run_selftest() -> int:
             check("mock↔固件:%s" % name, ok, det)
     finally:
         cli_c.close()
+
+    # --- 6. GUI 行为回归(方案三重构 + 体检修复)----------------------
+    print("\n[6] GUI 行为回归(方案三重构 + 体检修复)")
+    import inspect as _inspect
+
+    class _Btn:
+        def __init__(self):
+            self.state = None
+
+        def configure(self, **kw):
+            if "state" in kw:
+                self.state = kw["state"]
+
+    class _Var:
+        def __init__(self, v=None):
+            self.v = v
+
+        def set(self, v):
+            self.v = v
+
+        def get(self):
+            return self.v
+
+    class _Q:
+        def put(self, x):
+            pass
+
+    # 1) busy 时 submit 必须在结果面板给反馈(体检 P2-1 的回归锚)
+    class _BusyApp:
+        _show_result = App._show_result
+        _submit = App.submit
+
+        _log = lambda self, msg, tag="sys": None
+
+    ba = _BusyApp()
+    ba.result = _Screen()
+    ba._busy = True
+    ba._busy_label = "扫描 WiFi"
+    ba.busy_var = _Var("")
+    ba._set_buttons = lambda enabled: None
+    ba.jobs = _Q()
+    ba._submit("连接 X", lambda: None)
+    check("busy 时 submit 在结果面板给反馈",
+          "上一步还没完成" in ba.result.text()
+          and "扫描 WiFi" in ba.result.text(), ba.result.text()[:80])
+    ba2 = _BusyApp()
+    ba2.result = _Screen()
+    ba2._busy = False
+    ba2._busy_label = ""
+    ba2.busy_var = _Var("")
+    ba2._set_buttons = lambda enabled: None
+    ba2.jobs = _Q()
+    ba2._submit("正常任务", lambda: None)
+    check("空闲时 submit 正常入队并置 busy",
+          ba2._busy is True and ba2.busy_var.v == "正常任务 …", "")
+
+    # 2) _set_buttons 的禁用面 = _cmd_buttons(所有会发命令的按钮)
+    class _SetBtnApp:
+        _set_buttons = App._set_buttons
+
+    sb = _SetBtnApp()
+    sb._cmd_buttons = [_Btn(), _Btn()]
+    sb.status = None
+    sb._set_buttons(False)
+    check("busy 时全部命令按钮被禁用",
+          all(b.state == "disabled" for b in sb._cmd_buttons),
+          [b.state for b in sb._cmd_buttons])
+    sb._set_buttons(True)
+    check("空闲时全部命令按钮恢复",
+          all(b.state == "normal" for b in sb._cmd_buttons), "")
+
+    # 3) _apply_led_value 边界:>20 夹到滑块上限、百分比显示真值;非法值忽略
+    class _LedApp:
+        _apply_led_value = App._apply_led_value
+
+    la = _LedApp()
+    la.led_var = _Var(4)
+    la.led_pct_var = _Var("4%")
+    la._led_timer = None
+    la._apply_led_value(35)
+    check("LED 35%:滑块夹到 20,百分比显示真值",
+          la.led_var.v == 20 and la.led_pct_var.v == "35%",
+          "%r %r" % (la.led_var.v, la.led_pct_var.v))
+    check("LED 回填后挂起标志已复位", la._led_suspend is False, "")
+    la.led_var.v = 4
+    la.led_pct_var.v = "4%"
+    la._apply_led_value(0)
+    la._apply_led_value(None)
+    check("LED 非法值(0/None)不动滑块",
+          la.led_var.v == 4 and la.led_pct_var.v == "4%", "")
+
+    def _src_or_none(fn):
+        """源码环境给源码;冻结 exe 里 getsource 拿不到 .py(实测会抛),
+        返回 None —— 调用方退化为字节码常量断言,项数不变(同交叉核对模式)。"""
+        try:
+            return _inspect.getsource(fn)
+        except Exception:
+            return None
+
+    def _consts_text(fn):
+        """冻结 exe 的退化判定材料:递归收集 code object 的字符串常量与名字。"""
+        parts = []
+        stack = [fn.__code__]
+        while stack:
+            c = stack.pop()
+            stack.extend(x for x in c.co_consts if hasattr(x, "co_consts"))
+            parts.extend(str(x) for x in c.co_consts if isinstance(x, str))
+            parts.extend(c.co_names)
+        return "\n".join(parts)
+
+    # 4) 文案一致性固化成断言(本轮人工核对过,别让它们悄悄漂移)
+    src_done = _src_or_none(App._show_done)
+    txt_done = src_done if src_done is not None else _consts_text(App._show_done)
+    check("_show_done 含首包格式示例 19200E(无空格无换行)",
+          "19200E" in txt_done and "无空格无换行" in txt_done, "")
+    src_sum = _src_or_none(App._sta_summary)
+    txt_sum = src_sum if src_sum is not None else _consts_text(App._sta_summary)
+    check("_sta_summary 退避序列与固件一致(1/2/5/10/15/30)",
+          "1/2/5/10/15/30" in txt_sum, "")
+
+    # 5) pnputil 不许回 UI 线程:driver_installed 只许出现在后台 work() 里
+    src_drv = _src_or_none(App._usbip_driver_cached)
+    txt_drv = src_drv if src_drv is not None else _consts_text(App._usbip_driver_cached)
+    if src_drv is not None:
+        drv_ok = ("threading.Thread" in src_drv and "events.put" in src_drv
+                  and src_drv.count("driver_installed") == 1)
+    else:
+        # 字节码层:co_names 里 "threading.Thread"/"events.put" 是拆开的
+        # 名字,按碎片判;driver_installed 仍必须恰好出现一次(work 里)
+        drv_ok = (all(t in txt_drv for t in ("Thread", "start", "events", "put"))
+                  and txt_drv.count("driver_installed") == 1)
+    check("usbip 驱动检测已后台化(pnputil 只在工作线程里跑)", drv_ok, "")
+    check("驱动缓存仍支持 force 重新检测",
+          "force" in App._usbip_driver_cached.__code__.co_varnames, "")
+
+    # 6) 确认框之前必须先过 busy 闸门(体检 P2-1)
+    for m in ("_do_factory", "_do_delete", "_regen_ap_password"):
+        fn = getattr(App, m)
+        s = _src_or_none(fn)
+        if s is not None:
+            ok = 0 <= s.find("_busy") < s.find("askyesno")
+        else:
+            names = fn.__code__.co_names
+            ok = "_busy" in names and "askyesno" in names
+        check("%s 的 busy 闸门在确认框之前" % m, ok, "")
+
+    # 7) 手动命令超时按命令分流(体检 P3-3)
+    fn_man = App._send_manual
+    src_man = _src_or_none(fn_man)
+    txt_man = src_man if src_man is not None else _consts_text(fn_man)
+    check("手动命令超时:@CONNECT 走长超时,其余走默认",
+          "@CONNECT" in txt_man and "TIMEOUT_CONNECT" in txt_man
+          and "TIMEOUT_DEFAULT" in txt_man, "")
+
+    # 8) 排序方向语义:文本列升序、数值列降序
+    class _SortApp:
+        _sort_by = App._sort_by
+
+    so = _SortApp()
+    so._sort_col = "rssi"
+    so._sort_desc = True
+    so._render_scan = lambda: None
+    so._sort_by("rssi")            # 同列再点 = 反向
+    check("同列再点翻转方向", so._sort_desc is False, "")
+    so._sort_by("ssid")
+    check("换文本列默认升序",
+          so._sort_col == "ssid" and so._sort_desc is False, "")
+    so._sort_by("ch")
+    check("换数值列默认降序",
+          so._sort_col == "ch" and so._sort_desc is True, "")
+
+    # 9) 方案三结构:侧栏导航四页齐备
+    check("侧栏导航注册四个页面",
+          [k for k, _ in App.NAV_ITEMS]
+          == ["config", "saved", "debug", "log"],
+          str(getattr(App, "NAV_ITEMS", None)))
+
     # --- 汇总 --------------------------------------------------------
     print("\n" + "=" * 72)
     bad = [r for r in results if not r[1]]
