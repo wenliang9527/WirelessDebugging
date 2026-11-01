@@ -1,0 +1,29 @@
+# 最小 CI:只跑无硬件自测,防"改了协议忘跑自测"。
+# 体检(2026-11-01)结论:206+5 项自测全部零硬件可跑(--selftest 用假设备),
+# 因此这里不装任何依赖(pyserial 是延迟导入,自测不需要)。
+# 不做 PyInstaller 打包(分钟级,收益低);固件编译需要 ESP-IDF,另行考虑。
+name: selftest
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feature/**']
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: py_compile 语法检查
+        run: python -m py_compile tools/dap_config.py tools/dap_backends.py tools/build_package.py tools/capture_boot.py
+
+      - name: dap_config 自测(206 项,无硬件)
+        run: python tools/dap_config.py --selftest
+
+      - name: build_package 凭据检查自测
+        run: python tools/build_package.py --selftest
