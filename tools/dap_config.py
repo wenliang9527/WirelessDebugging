@@ -1994,8 +1994,14 @@ def run_selftest() -> int:
         check("stop_all 在无进程时安全", True, "")
 
         # --- AT32(usbip + atopenocd)---
+        # 断言的是 find_atopenocd 的**查找逻辑**,不是机器配置:雅特力 fork
+        # 装没装因机器而异(CI 上没有 D:\ARMGCCTool),所以判据是
+        # "查找结果与磁盘一致",而不是"必须找到"。
         base = B.find_atopenocd()
-        check("找到 atopenocd", base is not None, base or "未找到")
+        disk_has = (os.path.isdir(os.path.join(B.tools_root(), "atopenocd"))
+                    or os.path.isdir(B._ATOPENOCD_FALLBACK))
+        check("atopenocd 查找结果与磁盘一致", (base is not None) == bool(disk_has),
+              "find=%r disk=%r" % (base, disk_has))
         mgr2 = B.BackendManager("dap.local")
         if mgr2.has_at32():
             a = mgr2.at32_openocd
