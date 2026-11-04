@@ -30,3 +30,7 @@
   - **修掉一个静默构建缺陷**:`wifi_credentials.h` 由 `__has_include` 引入,编译器不记录"文件不存在"为依赖 → 增删该文件后增量编译不重编,表现为"改了配置却没生效"。已用 CMake `OBJECT_DEPENDS` + `build.bat` 状态检测双层修复,两方向均验证
 - [x] **硬件参数实测(2026-10-28,`esptool flash_id`)**:ESP32-S3 QFN56 rev v0.2 / **Flash 16MB** / PSRAM 8MB(未启用)/ QIO 3.3V / 40MHz 晶振 / MAC `aa:bb:cc:dd:ee:fc`。**16MB 意味着 OTA 完全可行**,原"2MB 太紧"的顾虑来自 sdkconfig 保守值,已排除
 - [x] **开发板资料确认(2026-10-28)**:板型 = **YD-ESP32-S3(ESP32-S3-WROOM-1-N16R8)**,44 脚双 USB-C,USB-UART 为 CH343P。完整 44 脚定义、与本项目的引脚对齐表见 [01_hardware/开发板资料.md](01_hardware/开发板资料.md)。**重要修正**:板载 RGB LED 是 **WS2812 接 GPIO48**(不是上游代码写的 GPIO4),必须用 RMT 驱动 → 新增 P2.5 任务;同时确认串口桥的 GPIO17/18 选择正确、CH343 在 PCB 上可省掉
+- [x] **产品化第一阶段收口(2026-11-01 ~ 11-02)**:配网(P0-P4/P2.5)+ 交付形态(A1A2/B1B2/C1C2)+ GUI 方案三侧栏重构 + 体检 Top10 全落地;固件 **0.8.1**(互斥锁 + 栈加固)真机回归 7/7;工具四模块拆分(`dap_proto/dap_mock/dap_gui/dap_selftest`),selftest **277 项**含 mock↔固件交叉核对与变异验证;净版开源收口(凭据外移、三仓库统一 **Apache-2.0**),CI 绿;板子已配网上线(192.168.0.125)。净版 0.8.1 bin 零凭据
+- [x] **第二阶段:离线烧录(2026-11-04,代码全量落地,真机验收待板子插回)** → 方案与验收表见 [00_preparation/产品化方案-离线烧录.md](00_preparation/产品化方案-离线烧录.md):
+  - **固件 0.9.0**:16MB 自定义分区表(nvs 保位升级,WiFi 配置不丢;ota_0/1 预留)、LittleFS 镜像存储(8 槽位 + NVS 索引,CRC 三方核对)、`@FLIST/@FSTAT/@FDEL/@FSEL/@FNAME/@FPUT/@FLASH/@FPROG`、TCP:1235 分块上传、**板上 SWD 烧录引擎**(直调 DAP 底层,PY32 自写 RAM loader 定槽位交叉编译,flash_algo 家族注册表)、与在线调试线锁互斥、GPIO0 长按 ≥2s 脱机触发、LED 三态反馈
+  - **工具**:「烧录文件」页(上传 WiFi 主/USB 兜底、切当前、一键烧录 + 进度轮询)、selftest 277 项(变异三杀验证)、交付包同步重打
