@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import time
 import threading
-from typing import List, Optional, Tuple
+import zlib
+from typing import Dict, List, Optional, Tuple
 
-from dap_proto import AP_DEFAULT_IP, Transport, dec
+from dap_proto import AP_DEFAULT_IP, Transport, dec, enc
 
 # ---------------------------------------------------------------------- #
 # 假设备:没有板子也能把界面完整点一遍(--mock / --selftest)
@@ -56,6 +57,18 @@ class MockTransport(Transport):
         self._led_pct = 4
         # 模拟 v0.8+ 的随机 AP 密码(真机是首启生成的 10 位)
         self._ap_pass = "K7M4RTW9XY"
+        # 离线烧录(0.9.0):8 槽位镜像 + 烧录进度机。预置一个演示镜像,
+        # 无板也能把「烧录文件」页完整点一遍。
+        self._files: Dict[int, dict] = {
+            0: {"name": "demo-blink.bin", "size": 2048,
+                "crc": "0a0b0c0d", "family": "PY32",
+                "addr": 0x08000000, "seq": 1},
+        }
+        self._cur = 0
+        self._seq = 1
+        self._fput = None          # 进行中的 USB 兜底上传会话
+        self._flash = {"state": "idle", "slot": -1, "pct": 0,
+                       "idcode": "00000000", "err": 0, "msg": ""}
 
     def open(self) -> None:
         self._open = True
@@ -103,7 +116,7 @@ class MockTransport(Transport):
         self._emit("I (1234) mock: got @%s" % cmd, 0.0)
 
         if cmd == "PING":
-            self._emit("@OK pong fw=0.8.0 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
+            self._emit("@OK pong fw=0.9.0 mac=AA:BB:CC:DD:EE:FC mode=%s" % self._mode, 0.02)
         elif cmd == "STATUS":
             if self._mode == "AP":
                 self._emit("@OK mode=AP ip=%s ssid=DAP-EEFC" % AP_DEFAULT_IP, 0.02)
@@ -225,8 +238,196 @@ class MockTransport(Transport):
         elif cmd == "REBOOT":
             self._emit("@OK rebooting", 0.02)
             self._emit("I (1) mock: rebooting", 0.2)
+        elif cmd == "FLIST":
+            self._mock_flist()
+        elif cmd == "FSTAT":
+            self._mock_fstat(args)
+        elif cmd == "FDEL":
+            self._mock_fdel(args)
+        elif cmd == "FSEL":
+            self._mock_fsel(args)
+        elif cmd == "FNAME":
+            self._mock_fname(args)
+        elif cmd == "FPUT":
+            self._mock_fput(args)
+        elif cmd == "FLASH":
+            self._mock_flash(args)
+        elif cmd == "FPROG":
+            f = self._flash
+            if f["state"] == "fail":
+                self._emit("@DATA state=%s slot=%d pct=%d idcode=%s err=%d msg=%s"
+                           % (f["state"], f["slot"], f["pct"], f["idcode"],
+                              f["err"], f["msg"]), 0.02)
+            else:
+                self._emit("@DATA state=%s slot=%d pct=%d idcode=%s"
+                           % (f["state"], f["slot"], f["pct"], f["idcode"]),
+                           0.02)
+            self._emit("@OK prog", 0.02)
         else:
             self._emit("@ERR 404 %s" % cmd, 0.02)
+
+    # --- 离线烧录(0.9.0)----------------------------------------------
+
+    def _fmeta_line(self, slot: int, meta: dict) -> str:
+        """与固件 fmeta_row 同构:name 走 URL 编码,cur 独立计算。"""
+        return ("slot=%d name=%s size=%d crc=%s family=%s addr=0x%08x seq=%d"
+                " cur=%d" % (slot, enc(meta["name"]), meta["size"], meta["crc"],
+                             meta["family"], meta["addr"], meta["seq"],
+                             1 if slot == self._cur else 0))
+
+    def _mock_flist(self) -> None:
+        for slot in sorted(self._files):
+            self._emit("@DATA " + self._fmeta_line(slot, self._files[slot]), 0.02)
+        self._emit("@OK files=%d cur=%d" % (len(self._files), self._cur), 0.03)
+
+    def _mock_fstat(self, args: str) -> None:
+        slot = self._slot_arg(args)
+        meta = self._files.get(slot) if slot is not None else None
+        if meta is None:
+            self._emit("@ERR 431 slot_empty", 0.02)
+            return
+        self._emit("@DATA " + self._fmeta_line(slot, meta), 0.02)
+        self._emit("@OK slot=%d" % slot, 0.02)
+
+    def _mock_fdel(self, args: str) -> None:
+        slot = self._slot_arg(args)
+        if slot is None:
+            self._emit("@ERR 400 usage: @FDEL slot=N", 0.02)
+            return
+        if slot not in self._files:
+            self._emit("@ERR 431 slot_empty", 0.02)
+            return
+        del self._files[slot]
+        if self._cur == slot:
+            # 与固件同构:删的是当前槽 → 回落最旧(seq 最小),全空则 -1
+            self._cur = (min(self._files, key=lambda s: self._files[s]["seq"])
+                         if self._files else -1)
+        self._emit("@OK deleted slot=%d cur=%d" % (slot, self._cur), 0.02)
+
+    def _mock_fsel(self, args: str) -> None:
+        slot = self._slot_arg(args)
+        if slot is None:
+            self._emit("@ERR 400 usage: @FSEL slot=N", 0.02)
+            return
+        if slot not in self._files:
+            self._emit("@ERR 431 slot_empty", 0.02)
+            return
+        self._cur = slot
+        self._emit("@OK current slot=%d" % slot, 0.02)
+
+    def _mock_fname(self, args: str) -> None:
+        slot = self._slot_arg(args)
+        name = _kv(args, "name") or ""
+        if slot is None or not name or len(name.encode("utf-8")) >= 32:
+            self._emit("@ERR 400 usage: @FNAME slot=N name=<enc>", 0.02)
+            return
+        if slot not in self._files:
+            self._emit("@ERR 431 slot_empty", 0.02)
+            return
+        self._files[slot]["name"] = name
+        self._emit("@OK renamed slot=%d" % slot, 0.02)
+
+    def _slot_arg(self, args: str) -> Optional[int]:
+        try:
+            slot = int(_kv(args, "slot") or "-99")
+        except ValueError:
+            return None
+        return slot if 0 <= slot < 8 else None
+
+    def _mock_fput(self, args: str) -> None:
+        parts = args.split(None, 1)
+        sub = parts[0].upper() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if sub == "BEGIN":
+            slot = self._slot_arg(rest)
+            name = _kv(rest, "name") or ""
+            family = _kv(rest, "family") or ""
+            try:
+                size = int(_kv(rest, "size") or "0")
+                crc = int(_kv(rest, "crc") or "0", 16)
+                addr = int(_kv(rest, "addr") or "0", 0)
+            except ValueError:
+                size, crc, addr = 0, 0, -1
+            if (slot is None or not name or len(name.encode("utf-8")) >= 32
+                    or size <= 0 or size % 2 or not family
+                    or len(family) >= 8 or addr < 0):
+                self._emit("@ERR 400 need slot_and_name", 0.02)
+                return
+            self._fput = {"slot": slot, "name": name, "size": size,
+                          "crc": crc, "family": family, "addr": addr, "buf": bytearray()}
+            self._emit("@OK begin slot=%d size=%d" % (slot, size), 0.02)
+        elif sub == "DATA":
+            if not self._fput:
+                self._emit("@ERR 405 no_upload_in_progress", 0.02)
+                return
+            hexpart = rest.strip()
+            try:
+                if len(hexpart) % 2 or len(hexpart) // 2 > 128:
+                    raise ValueError
+                block = bytes.fromhex(hexpart)
+            except ValueError:
+                self._fput = None
+                self._emit("@ERR 400 bad_hex_or_too_long", 0.02)
+                return
+            if len(self._fput["buf"]) + len(block) > self._fput["size"]:
+                self._fput = None
+                self._emit("@ERR 400 size_exceeds_declared", 0.02)
+                return
+            self._fput["buf"] += block
+            self._emit("@OK written=%d" % len(block), 0.02)
+        elif sub == "END":
+            if not self._fput:
+                self._emit("@ERR 405 no_upload_in_progress", 0.02)
+                return
+            up, self._fput = self._fput, None
+            if len(up["buf"]) != up["size"]:
+                self._emit("@ERR 400 size_mismatch", 0.02)
+                return
+            if zlib.crc32(bytes(up["buf"])) & 0xFFFFFFFF != up["crc"]:
+                self._emit("@ERR 432 crc_mismatch", 0.02)
+                return
+            self._seq += 1
+            self._files[up["slot"]] = {
+                "name": up["name"], "size": up["size"],
+                "crc": "%08x" % up["crc"], "family": up["family"],
+                "addr": up["addr"], "seq": self._seq}
+            self._emit("@OK saved crc_ok=1", 0.03)
+        elif sub == "ABORT":
+            self._fput = None
+            self._emit("@OK aborted", 0.02)
+        else:
+            self._emit("@ERR 400 usage: @FPUT begin|data|end|abort ...", 0.02)
+
+    def _mock_flash(self, args: str) -> None:
+        if self._flash["state"] == "running":
+            self._emit("@ERR 423 flash_in_progress", 0.02)
+            return
+        slot = self._slot_arg(args)
+        if slot is None:
+            slot = self._cur
+        if slot is None or slot < 0:
+            self._emit("@ERR 431 no_current_image", 0.02)
+            return
+        meta = self._files.get(slot)
+        if meta is None:
+            self._emit("@ERR 431 slot_empty", 0.02)
+            return
+        self._flash = {"state": "running", "slot": slot, "pct": 0,
+                       "idcode": "00000000", "err": 0, "msg": ""}
+        self._emit("@OK started slot=%d name=%s size=%d"
+                   % (slot, meta["name"], meta["size"]), 0.02)
+        # 后台推进假进度曲线:~3s 走完全程,idcode 在 3% 时"连上"
+        threading.Thread(target=self._flash_worker, args=(meta,), daemon=True).start()
+
+    def _flash_worker(self, meta: dict) -> None:
+        for pct in range(0, 101, 2):
+            time.sleep(0.06)
+            self._flash["pct"] = pct
+            if pct == 4:
+                self._flash["idcode"] = "0bc11477"  # PY32F0 的 DP IDCODE
+        self._flash["state"] = "done"
+        self._flash["msg"] = "ok"
 
     def _do_connect(self, ssid: str, pw: str) -> None:
         if self._mode != "STA":

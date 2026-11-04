@@ -218,6 +218,26 @@ ERR_INFO: Dict[int, ErrInfo] = {
                  "AP 模式下 IDF 驱动不支持扫描 WiFi —— 因为板子自己就是热点。",
                  "先点「切到 STA」,再扫描 / 连接。"),
     423: ErrInfo("设备忙", "上一条命令还在执行。", "稍等几秒再试。"),
+    # --- 离线烧录(第二阶段,430 段;对应固件 dap_cmd.h) ---
+    430: ErrInfo("存储分区不可用",
+                 "板子上的镜像存储区(storage 分区)没挂载成功,离线烧录整体不可用。",
+                 "多半是固件还是 0.9.0 之前的老版本;升级固件后仍报错就看板端日志 "
+                 "(dap_store 挂载失败原因)。"),
+    431: ErrInfo("这个槽位是空的",
+                 "该槽位没有存镜像(或索引与文件不一致被判定为空)。",
+                 "先在「烧录文件」页上传一个镜像,或换一个有文件的槽位。"),
+    432: ErrInfo("校验不过(CRC 不一致)",
+                 "上传时三方核对或烧录后回读校验发现数据不一致。",
+                 "重新上传一次;反复出现就怀疑供电/线缆(SWD 线加粗缩短,共地)。"),
+    433: ErrInfo("不认识这个目标家族",
+                 "镜像索引里的 family 在固件的算法注册表里没有对应条目"
+                 "(例如固件只带了 PY32,镜像是 AT32 的)。",
+                 "上传时选对家族;需要新家族支持就得升固件(注册表在 dap_flash_algo.c)。"),
+    434: ErrInfo("连不上目标板(SWD)",
+                 "SWD 连接/挂起/装载算法阶段失败:目标没供电、SWD 线接反或松动、"
+                 "或者目标不是这个家族的芯片。",
+                 "查目标板供电;查 SWDIO/SWCLK/GND 三线(见 01_hardware/接线参考.md);"
+                 "确认 family 选对。"),
     500: ErrInfo("设备内部错误", "固件内部调用失败,具体见板端日志。",
                  "切到「日志」页勾上「显示板端日志」看细节;必要时给板子断电重启。"),
 }
@@ -428,6 +448,73 @@ def parse_ap(body: str) -> Optional[ApInfo]:
         return None
     return ApInfo(ssid=m.group(1), password=m.group(2),
                   note=(m.group(3) or ""))
+
+
+# ====================================================================== #
+# 离线烧录:镜像与进度(第二阶段;对应固件 dap_cmd.c 的 fmeta_row/@FPROG)
+# ====================================================================== #
+
+class FlashImage:
+    """一个槽位里的烧录镜像(@FLIST/@FSTAT 的 @DATA 行)。"""
+    __slots__ = ("slot", "name", "size", "crc", "family", "addr", "seq", "current")
+
+    def __init__(self, slot: int, name: str, size: int, crc: str,
+                 family: str, addr: int, seq: int, current: bool):
+        self.slot = slot
+        self.name = name      # 已 URL 解码的显示名
+        self.size = size
+        self.crc = crc        # 8 位十六进制字符串(展示用)
+        self.family = family
+        self.addr = addr
+        self.seq = seq        # 上传序号:板上没有时钟,用它表达新旧
+        self.current = current
+
+
+def parse_fmeta(body: str) -> Optional[FlashImage]:
+    """slot=N name=<enc> size=N crc=XXXXXXXX family=S addr=0x.. seq=N cur=0/1"""
+    m = re.search(r"slot=(\d+)\s+name=(\S+)\s+size=(\d+)\s+crc=([0-9A-Fa-f]{8})"
+                  r"\s+family=(\S+)\s+addr=(0x[0-9A-Fa-f]+)\s+seq=(\d+)"
+                  r"\s+cur=([01])", body)
+    if not m:
+        return None
+    return FlashImage(int(m.group(1)), dec(m.group(2)), int(m.group(3)),
+                      m.group(4).lower(), m.group(5), int(m.group(6), 16),
+                      int(m.group(7)), m.group(8) == "1")
+
+
+class FlashProgress:
+    """@FPROG 的 @DATA 行:idle/running/done/fail + 百分比。"""
+    __slots__ = ("state", "slot", "pct", "idcode", "err", "msg")
+
+    def __init__(self, state: str, slot: int, pct: int,
+                 idcode: str, err: int, msg: str):
+        self.state = state
+        self.slot = slot
+        self.pct = pct
+        self.idcode = idcode    # 8 位十六进制;00000000 = 没连上目标
+        self.err = err          # fail 时为 dap_cmd.h 的错误码
+        self.msg = msg          # fail 时的蛇形原因(给 explain_reply 用)
+
+    @property
+    def running(self) -> bool:
+        return self.state == "running"
+
+    @property
+    def failed(self) -> bool:
+        return self.state == "fail"
+
+
+def parse_fprog(body: str) -> Optional[FlashProgress]:
+    m = re.search(r"state=(\w+)\s+slot=(-?\d+)\s+pct=(\d+)\s+idcode=([0-9A-Fa-f]*)",
+                  body)
+    if not m:
+        return None
+    err, msg = 0, ""
+    me = re.search(r"err=(\d+)\s+msg=(\S*)", body)
+    if me:
+        err, msg = int(me.group(1)), me.group(2)
+    return FlashProgress(m.group(1), int(m.group(2)), int(m.group(3)),
+                         m.group(4), err, msg)
 
 
 def version_tuple(v: str) -> Tuple[int, ...]:
@@ -922,6 +1009,16 @@ class DapClient:
             # 未登记时这里会走"保守放行",而唯一依赖它的场景就是
             # "上一条超时后的残留"——那条路上放行等于没保护,所以补上。
             "AP": ("ap ssid=",),
+            # 离线烧录(0.9.0):@FPUT 有四个子命令,各自 @OK 首词不同,
+            # 全部登记;@FLASH 在忙时回 @ERR,空闲时 "started slot="。
+            "FLIST": ("files=",),
+            "FSTAT": ("slot=",),
+            "FDEL": ("deleted",),
+            "FSEL": ("current",),
+            "FNAME": ("renamed",),
+            "FPUT": ("begin", "written", "saved", "aborted"),
+            "FLASH": ("started",),
+            "FPROG": ("prog",),
         }
         heads = expect.get(cmd)
         if not heads:
@@ -1002,6 +1099,55 @@ class DapClient:
 
     def led_set(self, pct: int) -> Reply:
         return self.request("@LED %d" % int(pct), 6.0)
+
+    # --- 离线烧录(0.9.0;固件 dap_cmd.c) -------------------------------
+
+    def flash_list(self) -> List[FlashImage]:
+        """全部镜像 + 当前标记。空列表也是正常结果。"""
+        r = self.request("@FLIST", 5.0)
+        if not r.ok:
+            raise DapError(r)
+        return [x for x in (parse_fmeta(b) for b in r.data) if x]
+
+    def flash_del(self, slot: int) -> Reply:
+        return self.request("@FDEL slot=%d" % slot, 6.0)
+
+    def flash_select(self, slot: int) -> Reply:
+        return self.request("@FSEL slot=%d" % slot, 5.0)
+
+    def flash_rename(self, slot: int, name: str) -> Reply:
+        return self.request("@FNAME slot=%d&name=%s" % (slot, enc(name)), 5.0)
+
+    def flash_start(self, slot: Optional[int] = None) -> Reply:
+        """触发离线烧录;slot 省略 = 当前镜像。"""
+        cmd = "@FLASH" if slot is None else "@FLASH slot=%d" % slot
+        return self.request(cmd, 5.0)
+
+    def flash_progress(self) -> FlashProgress:
+        r = self.request("@FPROG", 4.0)
+        if not r.ok:
+            raise DapError(r)
+        for b in r.data:
+            p = parse_fprog(b)
+            if p:
+                return p
+        raise IOError("@FPROG 应答没有可解析的 @DATA: %s" % r.text)
+
+    def fput_begin(self, slot: int, name: str, size: int, crc32: int,
+                   family: str, addr: int) -> Reply:
+        return self.request(
+            "@FPUT begin slot=%d&name=%s&size=%d&crc=%08x&family=%s&addr=0x%08x"
+            % (slot, enc(name), size, crc32, family, addr), 5.0)
+
+    def fput_data(self, chunk: bytes) -> Reply:
+        """一块数据(≤128 字节,固件命令行缓冲限制)。"""
+        return self.request("@FPUT data %s" % chunk.hex(), 4.0)
+
+    def fput_end(self) -> Reply:
+        return self.request("@FPUT end", 8.0)
+
+    def fput_abort(self) -> Reply:
+        return self.request("@FPUT abort", 4.0)
 
     def ap_get(self) -> ApInfo:
         """读 AP 热点 SSID 与密码(v0.8+)。

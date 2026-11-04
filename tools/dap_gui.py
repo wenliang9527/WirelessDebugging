@@ -24,13 +24,15 @@ from dap_proto import (
     RE_SCAN_DATA, RE_SCAN_OK, RE_STATUS_AP, RE_STATUS_STA,
     SETTINGS_KEYS, SETTINGS_VERSION,
     TIMEOUT_CONNECT, TIMEOUT_DEFAULT, TIMEOUT_SCAN, TOOL_VERSION,
-    ApInfo, DeviceInfo, DapError, ErrInfo, Network, Reply, SerialTransport,
-    Status, Transport,
+    ApInfo, DeviceInfo, DapError, ErrInfo, FlashImage, Network, Reply,
+    SerialTransport, Status, Transport,
     dec, delete_settings_file, enc, enumerate_ports, explain, explain_reply,
     load_settings, parse_ap, parse_list_data, parse_ping, parse_scan_data,
     parse_status, probe_all, probe_port, rssi_bar, rssi_word, save_settings,
     settings_path, version_tuple,
 )
+import dap_upload
+import zlib
 from dap_mock import MockTransport
 
 # ====================================================================== #
@@ -309,7 +311,7 @@ class App:
     #   2) 调试接入页底部那句"不要同时开"的安全警告不再被窗口下边缘裁掉
     #      (体检 P2-2:旧布局页内容超出可用高度且无滚动条,拉都拉不到)。
     NAV_ITEMS = (("config", "配网"), ("saved", "已保存网络"),
-                 ("debug", "调试接入"), ("log", "日志"))
+                 ("offline", "烧录文件"), ("debug", "调试接入"), ("log", "日志"))
 
     def _build_shell(self) -> None:
         tk, ttk = self._tk, self._ttk
@@ -398,6 +400,7 @@ class App:
 
         self._build_page_config(self._pages["config"])
         self._build_page_saved(self._pages["saved"])
+        self._build_page_offline(self._pages["offline"])
         self._build_page_debug(self._pages["debug"])
         self._build_page_log(self._pages["log"])
         self._show_page("config")
@@ -632,6 +635,379 @@ class App:
         tk.Label(bottom, text=note, bg=self.C_BG, fg=self.C_TEXT_DIM,
                  font=(ui, 9), justify="left",
                  anchor="w").pack(side="left", fill="x", expand=True)
+
+    def _build_page_offline(self, parent) -> None:
+        """烧录文件页:镜像管理 + 一键离线烧录(第二阶段)。"""
+        tk, ttk = self._tk, self._ttk
+        ui = self._ui
+
+        bar = tk.Frame(parent, bg=self.C_BG)
+        bar.pack(fill="x", pady=(0, self._px(6)))
+        b_up = ttk.Button(bar, text="上传镜像…", style="Primary.TButton",
+                          command=self._do_upload)
+        b_up.pack(side="left")
+        self._cmd_buttons.append(b_up)
+        b_cur = ttk.Button(bar, text="设为当前", style="Secondary.TButton",
+                           width=9, command=self._do_fsel)
+        b_cur.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_cur)
+        b_ren = ttk.Button(bar, text="改名", width=6,
+                           command=self._do_frename)
+        b_ren.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_ren)
+        b_del = ttk.Button(bar, text="删除选中", style="DangerOutline.TButton",
+                           command=self._do_fdel)
+        b_del.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_del)
+        b_ref = ttk.Button(bar, text="刷新", command=self._do_flist)
+        b_ref.pack(side="left", padx=(8, 0))
+        self._cmd_buttons.append(b_ref)
+
+        # 上传参数(新镜像的元数据):家族跟着固件算法注册表走,当前只有 PY32
+        row_meta = tk.Frame(parent, bg=self.C_BG)
+        row_meta.pack(fill="x", pady=(0, self._px(6)))
+        tk.Label(row_meta, text="目标家族", bg=self.C_BG, fg=self.C_TEXT_DIM,
+                 font=(ui, 9)).pack(side="left")
+        self.off_family = tk.StringVar(value="PY32")
+        cb = ttk.Combobox(row_meta, textvariable=self.off_family, width=8,
+                          state="readonly", values=["PY32"])
+        cb.pack(side="left", padx=(4, 12))
+        tk.Label(row_meta, text="烧录基址", bg=self.C_BG, fg=self.C_TEXT_DIM,
+                 font=(ui, 9)).pack(side="left")
+        self.off_addr = tk.StringVar(value="0x08000000")
+        ent = ttk.Entry(row_meta, textvariable=self.off_addr, width=12)
+        ent.pack(side="left", padx=(4, 0))
+        self.off_hint = tk.Label(row_meta, text="", bg=self.C_BG,
+                                 fg=self.C_TEXT_DIM, font=(ui, 9), anchor="e")
+        self.off_hint.pack(side="right")
+
+        cols = ("slot", "cur", "name", "size", "family", "addr", "seq")
+        wrap = tk.Frame(parent, bg=self.C_BG)
+        wrap.pack(fill="both", expand=True)
+        self.off_tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                     height=8)
+        for key, text, width, anchor in (
+                ("slot", "槽", 36, "center"),
+                ("cur", "当前", 50, "center"),
+                ("name", "镜像名称", 260, "w"),
+                ("size", "大小", 76, "e"),
+                ("family", "家族", 64, "center"),
+                ("addr", "基址", 96, "center"),
+                ("seq", "上传序", 60, "center")):
+            self.off_tree.heading(key, text=text)
+            self.off_tree.column(key, width=self._px(width),
+                                 minwidth=self._px(width), anchor=anchor,
+                                 stretch=(key == "name"))
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.off_tree.yview)
+        self.off_tree.configure(yscrollcommand=vsb.set)
+        self.off_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.off_tree.tag_configure("odd", background="#f6f8fb")
+
+        # 烧录区:一键烧录 + 进度条。进度条上传/烧录共用(两个阶段不会重叠)
+        row_flash = tk.Frame(parent, bg=self.C_BG)
+        row_flash.pack(fill="x", pady=(self._px(8), 0))
+        self.b_flash = ttk.Button(row_flash, text="一键烧录(当前镜像)",
+                                  style="Primary.TButton",
+                                  command=self._do_flash)
+        self.b_flash.pack(side="left")
+        self._cmd_buttons.append(self.b_flash)
+        self.off_bar = ttk.Progressbar(row_flash, maximum=100, length=220)
+        self.off_bar.pack(side="left", padx=(12, 8), fill="x", expand=True)
+        self.off_state = tk.StringVar(value="空闲")
+        tk.Label(row_flash, textvariable=self.off_state, bg=self.C_BG,
+                 fg=self.C_TEXT_DIM, font=(ui, 9), width=30,
+                 anchor="w").pack(side="left")
+
+        note = ("镜像存在调试器自己的存储区(最多 8 个);「一键烧录」由板上的\n"
+                "烧录引擎执行,不需要 PC 端 OpenOCD/usbip。没有电脑时也可:\n"
+                "板上 BOOT 键长按 ≥2 秒 = 烧「当前」镜像(绿=成功,红=失败)。\n"
+                "上传走 WiFi(快,需设备已连网);连不上自动回落 USB(慢,应急)。")
+        tk.Label(parent, text=note, bg=self.C_BG, fg=self.C_TEXT_DIM,
+                 font=(ui, 9), justify="left", anchor="w").pack(
+            fill="x", pady=(self._px(8), 0))
+
+    # --- 离线烧录动作 ---------------------------------------------------
+
+    def _err_text(self, err: BaseException) -> str:
+        """worker 抛错的统一文本:DapError 给人话,其他给异常本身。"""
+        if isinstance(err, DapError):
+            info = explain_reply(err.reply.code, err.reply.text)
+            return "%s(%s)" % (info.title, err.reply.text or err.reply.code)
+        return str(err)
+
+    def _ask_open_file(self, title: str, patterns) -> str:
+        from tkinter import filedialog
+        return filedialog.askopenfilename(
+            parent=self.root, title=title,
+            filetypes=patterns + [("所有文件", "*.*")])
+
+    def _ask_string(self, title: str, prompt: str, initial: str = "") -> Optional[str]:
+        from tkinter import simpledialog
+        return simpledialog.askstring(title, prompt, parent=self.root,
+                                      initialvalue=initial)
+
+    def _offline_gate(self) -> bool:
+        """离线命令的公共闸门:已连接 + 固件 ≥0.9。返回 False 时已给出提示。"""
+        if self.client is None:
+            self._show_result("先连接设备(右上「连接」)。", "warn")
+            return False
+        info = getattr(self.client, "info", None)
+        if info and version_tuple(info.fw) < (0, 9):
+            self._show_result(
+                "板上固件 %s 不含离线烧录功能,需要 0.9.0 或更新。\n"
+                "升级见 03_firmware/固件烧录指南.md(这次升级要连分区表一起烧)。" % info.fw,
+                "warn")
+            return False
+        return True
+
+    def _selected_slot(self) -> Optional[int]:
+        sel = self.off_tree.selection()
+        if not sel:
+            self._show_result("先在表格里选中一行。", "warn")
+            return None
+        return int(self.off_tree.item(sel[0], "values")[0])
+
+    def _do_flist(self) -> None:
+        if not self._offline_gate():
+            return
+        self.submit("刷新镜像列表", self._flist_job, self._after_flist)
+
+    def _flist_job(self) -> List[FlashImage]:
+        return self.client.flash_list()
+
+    def _after_flist(self, imgs, err) -> None:
+        if err is not None:
+            self._show_result("读镜像列表失败:%s" % self._err_text(err), "err")
+            return
+        self._fill_offline_tree(imgs or [])
+
+    def _fill_offline_tree(self, imgs: List[FlashImage]) -> None:
+        self.off_tree.delete(*self.off_tree.get_children())
+        for k, img in enumerate(sorted(imgs, key=lambda x: x.slot)):
+            size = "%d KB" % (img.size // 1024) if img.size >= 1024 else "%d B" % img.size
+            self.off_tree.insert("", "end",
+                                 values=(img.slot, "📌" if img.current else "",
+                                         img.name, size, img.family,
+                                         "0x%08X" % img.addr, "#%d" % img.seq),
+                                 tags=("odd",) if k % 2 else ())
+        self.off_hint.configure(
+            text="%d/8 槽位" % len(imgs) +
+                 (" · 无当前镜像" if imgs and not any(i.current for i in imgs)
+                  else ""))
+
+    def _do_fsel(self) -> None:
+        slot = self._selected_slot()
+        if slot is None:
+            return
+        self.submit("设为当前",
+                    lambda: self.client.flash_select(slot),
+                    lambda r, e: self._after_simple(r, e, "设为当前", self._do_flist))
+
+    def _do_fdel(self) -> None:
+        slot = self._selected_slot()
+        if slot is None:
+            return
+        name = self.off_tree.item(self.off_tree.selection()[0], "values")[2]
+        if not self._messagebox.askyesno(
+                "确认删除",
+                "删除槽位 %d 的「%s」?\n板上的镜像文件会一起删掉,不可恢复。"
+                % (slot, name)):
+            return
+        self.submit("删除镜像",
+                    lambda: self.client.flash_del(slot),
+                    lambda r, e: self._after_simple(r, e, "删除", self._do_flist))
+
+    def _do_frename(self) -> None:
+        slot = self._selected_slot()
+        if slot is None:
+            return
+        cur = self.off_tree.item(self.off_tree.selection()[0], "values")[2]
+        name = self._ask_string("改名", "新名字(UTF-8 编码后要小于 32 字节):", cur)
+        if name is None or not name.strip():
+            return
+        name = name.strip()
+        self.submit("改名",
+                    lambda: self.client.flash_rename(slot, name),
+                    lambda r, e: self._after_simple(r, e, "改名", self._do_flist))
+
+    def _after_simple(self, reply, err, what: str, refresh) -> None:
+        """flash_select/del/rename 的公共收尾:失败给人话,成功刷新列表。"""
+        if err is not None:
+            self._show_result("%s失败:%s" % (what, self._err_text(err)), "err")
+            return
+        if not reply.ok:
+            info = explain_reply(reply.code, reply.text)
+            self._show_result("%s失败:%s\n%s" % (what, info.title, info.action),
+                              "err")
+            return
+        refresh()
+
+    # -- 上传 ----------------------------------------------------------
+
+    def _do_upload(self) -> None:
+        if not self._offline_gate():
+            return
+        path = self._ask_open_file("选择镜像文件(.bin)",
+                                   [("BIN", "*.bin"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            self._show_result("读文件失败:%s" % exc, "err")
+            return
+        if not data:
+            self._show_result("空文件。", "warn")
+            return
+        if len(data) > 4 * 1024 * 1024:
+            self._show_result("镜像超过 4MB,当前家族的分区装不下。", "warn")
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            family = self.off_family.get().strip()
+            addr = int(self.off_addr.get().strip(), 16)
+        except ValueError:
+            self._show_result("烧录基址要是十六进制,如 0x08000000。", "warn")
+            return
+        if len(data) % 2:
+            self._show_result("镜像大小是奇数字节(%d B)。目标按 16 位半字编程,"
+                              "工具不做静默补零 —— 请从源头生成偶数镜像。" % len(data),
+                              "warn")
+            return
+        self.submit("上传镜像 %s" % name,
+                    lambda: self._upload_job(data, name, family, addr),
+                    self._after_upload)
+
+    def _upload_job(self, data: bytes, name: str, family: str,
+                    addr: int) -> Tuple[str, int]:
+        """工作线程里跑:选空槽 → WiFi 上传为主,失败回落 USB @FPUT。"""
+        used = {i.slot for i in self.client.flash_list()}
+        slot = next((s for s in range(8) if s not in used), None)
+        if slot is None:
+            raise RuntimeError("8 个槽位都满了,先删一个再传")
+
+        # WiFi 优先:快(几百 KB 秒级)。需要设备已连网且拿到 IP。
+        if not self.mock:
+            ip = None
+            try:
+                st = self.client.status()
+                ip = st.ip if getattr(st, "ip", "") else (
+                    AP_DEFAULT_IP if st.mode == "AP" else None)
+            except Exception:
+                ip = None
+            if ip:
+                try:
+                    dap_upload.upload_image(
+                        ip, slot, name, family, addr, data,
+                        progress=lambda p: self.events.put(
+                            ("offline_progress", (p, "上传中(WiFi)"))))
+                    return "wifi", slot
+                except (dap_upload.UploadError, OSError) as exc:
+                    self._log("WiFi 上传失败(%s),回落 USB 兜底…" % exc, "sys")
+
+        # USB 兜底:每行 128 字节,几百 KB 要传一两分钟,界面先说清楚
+        self.events.put(("offline_progress", (0, "上传中(USB 兜底,较慢)")))
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        r = self.client.fput_begin(slot, name, len(data), crc, family, addr)
+        if not r.ok:
+            raise DapError(r)
+        try:
+            step = max(1, len(data) // 100)
+            for off in range(0, len(data), 128):
+                r = self.client.fput_data(data[off:off + 128])
+                if not r.ok:
+                    raise DapError(r)
+                if off % step < 128:
+                    self.events.put(("offline_progress",
+                                     (off * 100 // len(data), "上传中(USB 兜底)")))
+            r = self.client.fput_end()
+            if not r.ok:
+                raise DapError(r)
+        except BaseException:
+            try:
+                self.client.fput_abort()
+            except Exception:
+                pass
+            raise
+        return "usb", slot
+
+    def _after_upload(self, result, err) -> None:
+        if err is not None:
+            self.events.put(("offline_progress", (0, "上传失败")))
+            if isinstance(err, DapError):
+                info = explain_reply(err.reply.code, err.reply.text)
+                self._show_result("上传失败:%s\n%s" % (info.title, info.action), "err")
+            else:
+                self._show_result("上传失败:%s" % self._err_text(err), "err")
+            return
+        via, slot = result
+        self._show_result("已存入槽位 %d(%s)。烧录前可在表格里核对 CRC/大小。"
+                          % (slot, "WiFi" if via == "wifi" else "USB 兜底"), "ok")
+        self.events.put(("offline_progress", (100, "上传完成")))
+        self._do_flist()
+
+    # -- 烧录与进度轮询 --------------------------------------------------
+
+    def _do_flash(self) -> None:
+        if not self._offline_gate():
+            return
+        sel = self.off_tree.selection()
+        slot = int(self.off_tree.item(sel[0], "values")[0]) if sel else None
+        self.submit("触发烧录",
+                    lambda: self.client.flash_start(slot),
+                    lambda r, e: self._after_flash_start(r, e))
+
+    def _after_flash_start(self, reply, err) -> None:
+        if err is not None:
+            self._show_result("触发失败:%s" % self._err_text(err), "err")
+            return
+        if not reply.ok:
+            info = explain_reply(reply.code, reply.text)
+            self._show_result("烧录没能开始:%s\n%s" % (info.title, info.action),
+                              "err")
+            return
+        self.events.put(("offline_progress", (0, "烧录中")))
+        self._log("烧录已开始,进度轮询中…", "sys")
+        self.root.after(500, self._poll_flash)
+
+    def _poll_flash(self) -> None:
+        """500ms 一拍地查 @FPROG。走 submit_bg(不占 busy 闸门,按钮保持可用,
+        用户此刻点别的操作只会在这条串行队列里排队,不会互相踩)。"""
+        if getattr(self, "_closing", False):
+            return
+        self.submit_bg("烧录进度", self.client.flash_progress,
+                       self._after_flash_poll)
+
+    def _after_flash_poll(self, prog, err) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if err is not None or prog is None:
+            # 偶发超时不终止轮询:烧录还在板上跑,下一拍多半就回来了
+            self._poll_miss = getattr(self, "_poll_miss", 0) + 1
+            if self._poll_miss >= 6:
+                self.events.put(("offline_progress", (0, "进度丢失")))
+                self._show_result("连续 3 秒取不到进度。烧录可能仍在板上进行,"
+                                  "稍后点「刷新」看结果,或看板上灯:绿=成/红=败。",
+                                  "warn")
+                self._poll_miss = 0
+                return
+            self.root.after(500, self._poll_flash)
+            return
+        self._poll_miss = 0
+        self.events.put(("offline_progress",
+                         (prog.pct, "烧录中" if prog.running else prog.state)))
+        if prog.running:
+            self.root.after(500, self._poll_flash)
+        elif prog.state == "done":
+            self._show_result("烧录完成(100%%,回读校验通过)。目标已复位运行。",
+                              "ok")
+        else:
+            info = explain_reply(prog.err, prog.msg)
+            self._show_result("烧录失败:%s\n%s\n(目标 IDCODE=%s)"
+                              % (info.title, info.action, prog.idcode or "?"),
+                              "err")
 
     def _build_page_log(self, parent) -> None:
         """日志页:黑底彩色日志 + 手动命令。"""
@@ -1373,6 +1749,16 @@ class App:
         self._set_buttons(False)
         self.jobs.put((label, fn, done))
 
+    def submit_bg(self, label: str, fn: Callable[[], object],
+                  done: Optional[Callable[[object, Optional[BaseException]], None]] = None
+                  ) -> None:
+        """排队但**不占 busy 闸门**:给轻量周期轮询用(@FPROG 500ms 一拍)。
+
+        与 submit() 共用同一条 worker 队列,串行 I/O 的保证不变;区别只是
+        不禁按钮、不拦后续 submit —— 轮询期间用户点别的操作只会自然排队,
+        不会互相踩。只准只读快命令走这里(写操作仍走 submit,防连点重入)。"""
+        self.jobs.put((label, fn, done))
+
     def _worker_loop(self) -> None:
         while True:
             job = self.jobs.get()
@@ -1415,6 +1801,14 @@ class App:
                         self._on_usbip_attached(payload)
                     except Exception as exc:
                         self._log("usbip 挂载状态回调异常: %r" % (exc,), "err")
+                elif kind == "offline_progress":
+                    pct, text = payload
+                    try:
+                        self.off_bar["value"] = pct
+                        self.off_state.set("%s %d%%" % (text, pct)
+                                           if text else "%d%%" % pct)
+                    except Exception:
+                        pass  # 页面控件还在(常驻),到这说明快关窗了,丢弃即可
                 elif kind == "job_done":
                     label, result, err, done = payload
                     self._busy = False
@@ -1581,6 +1975,11 @@ class App:
             return
         st, _rows, _src, led, _ap = result
         self._apply_led_value(led)
+        # 顺带后台拉一次镜像列表(0.9+ 固件才有;老固件静默跳过,
+        # 不弹错误 —— 配网功能在老固件上必须照常可用)
+        info = getattr(self.client, "info", None)
+        if info and version_tuple(info.fw) >= (0, 9):
+            self.submit_bg("刷新镜像列表", self._flist_job, self._after_flist)
         if st.mode != "STA":
             return
         self.submit("扫描 WiFi", self._scan_worker, self._after_scan)
