@@ -220,8 +220,10 @@ def assemble(pkg_root: str) -> None:
     print("[3/4] 固件与文档…")
     fw = os.path.join(pkg_root, "firmware")
     os.makedirs(fw, exist_ok=True)
-    # IDF 的 build 布局:app 在 build/ 根,bootloader/partition 在各自子目录
+    # IDF 的 build 布局:app 在 build/ 根,bootloader/partition 在各自子目录。
+    # ota_data_initial 自 0.9.0 必须：分区表含 otadata,升级烧 0x190000。
     for rel in ("wireless_esp_dap.bin",
+                "ota_data_initial.bin",
                 os.path.join("bootloader", "bootloader.bin"),
                 os.path.join("partition_table", "partition-table.bin")):
         shutil.copyfile(os.path.join(SRC_FIRMWARE, rel),
