@@ -27,10 +27,13 @@ from dap_proto import (
     _MSG_OVERRIDE, _is_likely_dap_port,
     ApInfo, DapClient, Reply, Status, Transport,
     dec, delete_settings_file, enc, explain, explain_reply,
-    load_settings, parse_ap, parse_list_data, parse_ping, parse_scan_data,
+    load_settings, parse_ap, parse_fmeta, parse_fprog, parse_list_data,
+    parse_ping, parse_scan_data,
     parse_status, probe_port, rssi_bar, rssi_word, save_settings,
     settings_path, version_tuple,
 )
+import dap_upload
+import zlib
 from dap_mock import MOCK_FACTORY_NETS, MOCK_SCAN, MockTransport
 from dap_gui import App
 
@@ -114,6 +117,47 @@ _FW_CONTRACTS = [
     ("@LED 查询", r'led pct=%d',
      lambda c: c.request("@LED", 3.0),
      _txt(r"led pct=\d+$")),
+    # --- 离线烧录(0.9.0)。字面量是 dap_cmd.c 里的连续片段;fmeta 行
+    # 在固件里因 PRIX32 拼接断开,取第一段连续字面量做存在性核对,
+    # 字段完整性由 mock 回复 + parse_fmeta 正则兜住。
+    ("@FLIST 数据行", r'slot=%d name=%s size=%u crc=%08',
+     lambda c: c.request("@FLIST", 3.0),
+     lambda rep: (bool(rep.data) and
+                  all(parse_fmeta(b) is not None for b in rep.data),
+                  "; ".join(rep.data[:2]))),
+    ("@FLIST 汇总", r'files=%d cur=%d',
+     lambda c: c.request("@FLIST", 3.0),
+     _txt(r"files=\d+ cur=-?\d+$")),
+    ("@FSTAT 终结", r'slot=%d',
+     lambda c: c.request("@FSTAT slot=0", 3.0),
+     _txt(r"slot=\d+$")),
+    ("@FSEL 回复", r'current slot=%d',
+     lambda c: c.flash_select(0),
+     _txt(r"current slot=\d+$")),
+    ("@FNAME 回复", r'renamed slot=%d',
+     lambda c: c.flash_rename(0, "demo"),
+     _txt(r"renamed slot=\d+$")),
+    ("@FPUT begin 回复", r'begin slot=%d size=%u',
+     lambda c: c.fput_begin(3, "ctr.bin", 8,
+                            zlib.crc32(b"\x11" * 8), "PY32", 0x08000000),
+     _txt(r"begin slot=\d+ size=\d+$")),
+    ("@FPUT data 回复", r'written=%u',
+     lambda c: (c.fput_data(b"\x11" * 8)),
+     _txt(r"written=\d+$")),
+    ("@FPUT end 回复", r'saved crc_ok=1',
+     lambda c: c.fput_end(),
+     _txt(r"saved crc_ok=1$")),
+    ("@FPROG 数据行", r'state=%s slot=%d pct=%d idcode=%08x',
+     lambda c: c.request("@FPROG", 3.0),
+     _data0(re.compile(r"state=(?:idle|running|done|fail) slot=-?\d+"
+                       r" pct=\d+ idcode=[0-9a-f]*$"))),
+    ("@FDEL 回复", r'deleted slot=%d cur=%d',
+     lambda c: c.flash_del(3),
+     _txt(r"deleted slot=\d+ cur=-?\d+$")),
+    # 放最后:mock 烧录 ~3s,后面的 [7] 段会先等它结束
+    ("@FLASH 回复", r'started slot=%d name=%s size=%u',
+     lambda c: c.flash_start(0),
+     _txt(r"started slot=\d+ name=\S+ size=\d+$")),
 ]
 def run_selftest() -> int:
     """不碰硬件,验证协议解析 + 完整交互流程。返回 0 表示全过。"""
@@ -221,7 +265,7 @@ def run_selftest() -> int:
     client.open()
     try:
         info = client.ping()
-        expect_eq("PING fw", info.fw, "0.8.0")
+        expect_eq("PING fw", info.fw, "0.9.0")
         st = client.status()
         check("初始 STA", st.mode == "STA", repr(st))
 
@@ -1295,6 +1339,147 @@ def run_selftest() -> int:
     finally:
         cli_c.close()
 
+    # --- 5.5 离线烧录:端到端 + 帧打包 + 判别表(0.9.0)-------------------
+    print("\n[5.5] 离线烧录(端到端 + 帧打包 + 判别表)")
+    tr_o = MockTransport(connect_delay=0.0)
+    c_o = DapClient(tr_o)
+    c_o.open()
+    try:
+        # 上一段契约的 @FLASH 可能还在假进度里跑,先等它落地
+        for _ in range(120):
+            if c_o.flash_progress().state != "running":
+                break
+            time.sleep(0.1)
+
+        # 名字含空格+中文:上传 → 列表 → 解析往返
+        blob = bytes(range(256)) * 4          # 1024 B,偶数
+        odd_name = "固件 v9.bin"
+        r = c_o.fput_begin(5, odd_name, len(blob), zlib.crc32(blob),
+                           "PY32", 0x08000000)
+        check("FPUT begin 接受中文名", r.ok and r.text.startswith("begin slot=5"),
+              r.text)
+        n_ok = all(c_o.fput_data(blob[o:o + 128]).ok
+                   for o in range(0, len(blob), 128))
+        check("FPUT data 全块 OK", n_ok)
+        r = c_o.fput_end()
+        check("FPUT end 落库", r.ok and r.text == "saved crc_ok=1", r.text)
+        imgs = c_o.flash_list()
+        img5 = next((i for i in imgs if i.slot == 5), None)
+        check("FLIST 名字往返(空格+中文)",
+              img5 is not None and img5.name == odd_name,
+              img5.name if img5 else "(slot5 没了)")
+        check("FLIST CRC/家族/基址往返",
+              img5 is not None
+              and img5.crc == "%08x" % (zlib.crc32(blob) & 0xFFFFFFFF)
+              and img5.family == "PY32" and img5.addr == 0x08000000,
+              repr(img5))
+
+        # 错误路径:CRC 不符 / 超长
+        c_o.fput_begin(6, "bad.bin", 4, 0xDEADBEEF, "PY32", 0x08000000)
+        c_o.fput_data(b"\x01\x02\x03\x04")
+        r = c_o.fput_end()
+        check("FPUT CRC 不符被拒(432)", not r.ok and r.code == 432,
+              "%s %s" % (r.code, r.text))
+        c_o.fput_begin(6, "big.bin", 4, zlib.crc32(b"\x01\x02\x03\x04"),
+                       "PY32", 0x08000000)
+        r = c_o.fput_data(b"\x01\x02\x03\x04\x05\x06")
+        check("FPUT 超长被拒(400)", not r.ok and r.code == 400,
+              "%s %s" % (r.code, r.text))
+
+        # 当前标记:设当前 → 删当前回落最旧(seq 最小 = 演示镜像 slot0)
+        c_o.flash_select(5)
+        r = c_o.flash_del(5)
+        check("删当前后回落最旧", r.ok)
+        imgs = c_o.flash_list()
+        cur = next((i.slot for i in imgs if i.current), None)
+        check("回落目标是 slot0(最旧)", cur == 0, "cur=%s" % cur)
+
+        # 烧录状态机:启动 → 进行中再触发被拒(423)→ done
+        r = c_o.flash_start(0)
+        check("FLASH 启动", r.ok and r.text.startswith("started"), r.text)
+        r2 = c_o.flash_start(0)
+        check("烧录中再触发被拒(423)", not r2.ok and r2.code == 423,
+              "%s %s" % (r2.code, r2.text))
+        prog = None
+        for _ in range(120):
+            prog = c_o.flash_progress()
+            if not prog.running:
+                break
+            time.sleep(0.1)
+        check("进度走到 done", prog is not None and prog.state == "done",
+              repr(prog))
+        check("idcode 已上报(PY32)", prog is not None and prog.idcode == "0bc11477",
+              prog.idcode if prog else "-")
+        p = parse_fprog("state=fail slot=2 pct=70 idcode=0bc11477 "
+                        "err=434 msg=target_connect_fail")
+        check("FPROG fail 行解析",
+              p is not None and p.failed and p.err == 434
+              and p.msg == "target_connect_fail", repr(p))
+
+        # dap_upload 帧布局:与固件 dap_upload.c 的 BEGIN 结构逐字段对齐
+        try:
+            payload = dap_upload._BEGIN.pack(3, b"abc", 16, 0x11223344,
+                                             b"PY32", 0x08000000)
+            check("BEGIN 帧 53 字节定长", len(payload) == 53, len(payload))
+            slot_b = payload[0]
+            name_b = payload[1:33].rstrip(b"\x00")
+            size_b = int.from_bytes(payload[33:37], "little")
+            crc_b = int.from_bytes(payload[37:41], "little")
+            fam_b = payload[41:49].rstrip(b"\x00")
+            addr_b = int.from_bytes(payload[49:53], "little")
+            check("BEGIN 帧字段小端对齐",
+                  slot_b == 3 and name_b == b"abc" and size_b == 16
+                  and crc_b == 0x11223344 and fam_b == b"PY32"
+                  and addr_b == 0x08000000,
+                  "%r" % payload)
+        except Exception as exc:
+            check("BEGIN 帧 53 字节定长", False, repr(exc))
+            check("BEGIN 帧字段小端对齐", False, repr(exc))
+        check("上传状态码枚举 0..6",
+              (dap_upload.ST_OK, dap_upload.ST_BUSY, dap_upload.ST_BAD_ARG,
+               dap_upload.ST_IO, dap_upload.ST_SIZE, dap_upload.ST_CRC,
+               dap_upload.ST_PROTOCOL) == tuple(range(7)), "")
+        for bad, why in ((b"", "空文件"), (b"\x01", "奇数字节"),
+                         (b"\x01\x02", "名字太长")):
+            nm = "x" * 40 if why == "名字太长" else "ok.bin"
+            try:
+                dap_upload.upload_image("127.0.0.1", 0, nm, "PY32",
+                                        0x08000000, bad)
+                check("上传本地校验拦下(%s)" % why, False, "没抛")
+            except dap_upload.UploadError:
+                check("上传本地校验拦下(%s)" % why, True, "")
+            except OSError:
+                check("上传本地校验拦下(%s)" % why, False,
+                      "参数没拦住就去做连接了")
+
+        # 迟到应答判别:新命令必须登记,裸查会串味
+        check("判别表登记 FLIST",
+              c_o._looks_like_reply_to("@FLIST", "@OK", "files=1 cur=0"), "")
+        check("判别表挡住 FLIST 回复串给 SCAN",
+              not c_o._looks_like_reply_to("@SCAN", "@OK", "files=1 cur=0"), "")
+        check("判别表登记 FPROG(终结首词 prog)",
+              c_o._looks_like_reply_to("@FPROG", "@OK", "prog"), "")
+        check("判别表登记 FPUT 多首词",
+              c_o._looks_like_reply_to("@FPUT", "@OK", "saved crc_ok=1"), "")
+        # 判别表的"登记存在性"行为测不出来:未登记命令走保守放行,删掉
+        # 登记后放行依旧 True(变异验证证过)。按项目先例用源码断言:
+        # 冻结 exe 上 getsource 必抛,退化为跳过,总项数不变。
+        import inspect as _insp
+        try:
+            _src = _insp.getsource(DapClient._looks_like_reply_to)
+            check("判别表源码含 FLIST/FLASH 登记",
+                  '"FLIST"' in _src and '"FLASH"' in _src and '"FPROG"' in _src,
+                  "")
+        except (TypeError, OSError):
+            check("判别表源码含 FLIST/FLASH 登记(exe 退化跳过)", True, "")
+
+        # 错误码人话:430 段必须都有,别让用户看到"未知错误"
+        for code in (430, 431, 432, 433, 434):
+            check("错误码 %d 有人话" % code,
+                  explain(code).title != "未知错误", explain(code).title)
+    finally:
+        c_o.close()
+
     # --- 6. GUI 行为回归(方案三重构 + 体检修复)----------------------
     print("\n[6] GUI 行为回归(方案三重构 + 体检修复)")
     import inspect as _inspect
@@ -1466,9 +1651,9 @@ def run_selftest() -> int:
           so._sort_col == "ch" and so._sort_desc is True, "")
 
     # 9) 方案三结构:侧栏导航四页齐备
-    check("侧栏导航注册四个页面",
+    check("侧栏导航注册五个页面",
           [k for k, _ in App.NAV_ITEMS]
-          == ["config", "saved", "debug", "log"],
+          == ["config", "saved", "offline", "debug", "log"],
           str(getattr(App, "NAV_ITEMS", None)))
 
     # --- 汇总 --------------------------------------------------------
